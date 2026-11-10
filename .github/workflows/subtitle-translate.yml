@@ -55,6 +55,14 @@ on:
         description: "补烧模式: 对有 srt 但缺字幕版视频的组只拼片+烧制(不重跑转写)"
         required: false
         default: "false"
+      fix_srt:
+        description: "修复模式: 重译已有 srt 的日文残留, 写回并重烧硬字幕"
+        required: false
+        default: "false"
+      no_reburn:
+        description: "配合 fix_srt: 只修 srt 不重烧视频"
+        required: false
+        default: "false"
 
 concurrency:
   # 按 batch_tag 唯一, 允许多批并行跑不同组(不会互相取消); cancel-in-progress 仍关
@@ -130,6 +138,8 @@ jobs:
           BURN_VIDEO: ${{ inputs.burn_video || 'true' }}
           FORCE: ${{ inputs.force || 'false' }}
           BURN_ONLY: ${{ inputs.burn_only || 'false' }}
+          FIX_SRT: ${{ inputs.fix_srt || 'false' }}
+          NO_REBURN: ${{ inputs.no_reburn || 'false' }}
         run: |
           set -e
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
@@ -140,6 +150,8 @@ jobs:
           if [ "$PROBE_ONLY" != "0" ]; then ARGS="$ARGS --probe-only $PROBE_ONLY"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
           if [ "$BURN_ONLY" = "true" ]; then ARGS="$ARGS --burn-only"; fi
+          if [ "$FIX_SRT" = "true" ]; then ARGS="$ARGS --fix-srt"; fi
+          if [ "$NO_REBURN" = "true" ]; then ARGS="$ARGS --no-reburn"; fi
           python3 subtitle_translate.py $ARGS
 
       - name: 上传 srt 统计(可选)
