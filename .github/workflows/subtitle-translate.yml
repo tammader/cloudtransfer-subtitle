@@ -77,7 +77,7 @@ jobs:
           test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
           grep -E '^\[' ~/.config/rclone/rclone.conf | sed 's/$/: <masked>/'
 
-      - name: 装 Python 3.11(av 12.x 有 cp311 预编译 wheel)
+      - name: 装 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -85,8 +85,11 @@ jobs:
       - name: 装 faster-whisper
         run: |
           python3 -m pip install --quiet --upgrade pip
-          # Python 3.11 + 有 wheel 的 av 版本; faster-whisper 锁 1.0.3 规避 metadata_errors 漂移
-          python3 -m pip install --quiet "av==12.3.0" "faster-whisper==1.0.3" "ctranslate2==4.4.0"
+          # 三件套用近期自洽版本:
+          #   av>=14 (有 cp311 wheel, 且 <19 避免 metadata_errors 旧坑)
+          #   ctranslate2>=4.5 (修 4.4.0 的 execstack "cannot enable executable stack" bug)
+          #   faster-whisper 1.2.x 官方支持上述组合
+          python3 -m pip install --quiet "av==18.1.0" "ctranslate2==4.8.5" "faster-whisper==1.2.1"
           python3 -c "import faster_whisper, av, ctranslate2; print('fw', faster_whisper.__version__, '| av', av.__version__, '| ct2', ctranslate2.__version__)"
 
       - name: 跑字幕流水线
