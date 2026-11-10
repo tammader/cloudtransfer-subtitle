@@ -35,9 +35,18 @@ on:
         description: "验证用: 只转写前 N 秒(如 120), 不上传; 0=正常全量"
         required: false
         default: "0"
+      batch_tag:
+        description: "批次标识(仅用于并发分组, 留空=用 run_id)"
+        required: false
+        default: ""
+      start_index:
+        description: "从待处理列表第 K 个开始(并行分批); 配合 limit_groups 划分区间"
+        required: false
+        default: "0"
 
 concurrency:
-  group: subtitle-translate
+  # 按 batch_tag 唯一, 允许多批并行跑不同组(不会互相取消); cancel-in-progress 仍关
+  group: subtitle-translate-${{ inputs.batch_tag || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -104,9 +113,10 @@ jobs:
           BUDGET_MIN: ${{ inputs.budget_min || '300' }}
           WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3' }}
           PROBE_ONLY: ${{ inputs.probe_only || '0' }}
+          START_INDEX: ${{ inputs.start_index || '0' }}
         run: |
           set -e
-          ARGS="--limit-groups $LIMIT_GROUPS --budget-min $BUDGET_MIN"
+          ARGS="--limit-groups $LIMIT_GROUPS --budget-min $BUDGET_MIN --start-index $START_INDEX"
           if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
           if [ "$PROBE_ONLY" != "0" ]; then ARGS="$ARGS --probe-only $PROBE_ONLY"; fi
