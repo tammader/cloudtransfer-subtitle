@@ -155,15 +155,17 @@ def concat_parts(local_parts, outpath):
 
 
 # ---------------- ASR ----------------
-def transcribe(video_path, whisper_model):
+def transcribe(video_path, whisper_model, max_seconds=0):
     """faster-whisper 日文转写, 返回 [(start, end, text), ...]"""
     from faster_whisper import WhisperModel
     log("加载 whisper 模型 %s (CPU int8)..." % whisper_model)
     model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
 
     def _run(use_vad):
-        log("开始转写(日文, vad=%s)..." % use_vad)
+        log("开始转写(日文, vad=%s, max_s=%s)..." % (use_vad, max_seconds or "full"))
         kw = dict(language="ja", beam_size=5, condition_on_previous_text=False)
+        if max_seconds:
+            kw["clip_timestamps"] = "0,%d" % max_seconds
         if use_vad:
             kw["vad_filter"] = True
             kw["vad_parameters"] = {"min_silence_duration_ms": 500, "threshold": 0.3,
@@ -173,14 +175,19 @@ def transcribe(video_path, whisper_model):
         segments, info = model.transcribe(video_path, **kw)
         log("检测语种=%s p=%.2f, 时长=%.1fs" % (info.language, info.language_probability, info.duration))
         out = []
+        lastlog = time.time()
         for seg in segments:
             txt = (seg.text or "").strip()
             if txt:
                 out.append((seg.start, seg.end, txt))
+            # 每 30s 打一次进度(能看到是否在推进)
+            if time.time() - lastlog > 30:
+                log("  转写进度: 已到 %.0fs / 共 %.0fs, 已收 %d 条" % (seg.end, info.duration, len(out)))
+                lastlog = time.time()
         return out
 
     out = _run(True)
-    if not out:
+    if not out and not max_seconds:
         log("!! VAD 后无字幕, 回退到无 VAD 重转写")
         out = _run(False)
     log("转写完成: %d 条字幕" % len(out))
@@ -280,8 +287,8 @@ def write_srt(segs, path):
 
 
 # ---------------- 主流程 ----------------
-def process_group(remote, path, base, parts, workdir, apply):
-    log("处理组 (parts=%d)" % len(parts))
+def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0):
+    log("处理组 (parts=%d, probe=%s)" % (len(parts), probe_seconds or "off"))
     if not apply:
         return
     t0 = time.time()
@@ -291,7 +298,15 @@ def process_group(remote, path, base, parts, workdir, apply):
     video = os.path.join(gdir, "merged.mp4")
     concat_parts(local_parts, video)
     log("拼接完成 -> %.1f MB" % (os.path.getsize(video) / 1048576.0))
-    segs = transcribe(video, WHISPER_MODEL)
+    segs = transcribe(video, WHISPER_MODEL, max_seconds=probe_seconds)
+    if probe_seconds:
+        log("=== PROBE 结果: 前 %ds 收到 %d 条字幕 ===" % (probe_seconds, len(segs)))
+        for st, en, tx in segs[:10]:
+            log("  [%.1f-%.1f] %s" % (st, en, tx))
+        for p in local_parts + [video]:
+            try: os.remove(p)
+            except Exception: pass
+        return
     if not segs:
         log("!! 无字幕段, 跳过")
         return
@@ -319,6 +334,7 @@ def main():
     ap.add_argument("--limit-groups", type=int, default=0)
     ap.add_argument("--budget-min", type=int, default=300)
     ap.add_argument("--list", action="store_true", help="只列出分组统计")
+    ap.add_argument("--probe-only", type=int, default=0, help="只转写前 N 秒做验证(不上传)")
     a = ap.parse_args()
 
     if not SRC_REMOTE:
@@ -360,7 +376,8 @@ def main():
             log("!! 到达时间预算, 收工")
             break
         try:
-            process_group(SRC_REMOTE, SRC_DIR, base, groups[base], workdir, a.apply)
+            process_group(SRC_REMOTE, SRC_DIR, base, groups[base], workdir, a.apply,
+                          probe_seconds=a.probe_only)
             ok += 1
         except Exception as e:
             fail += 1
