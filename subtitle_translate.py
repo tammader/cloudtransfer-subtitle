@@ -336,6 +336,7 @@ def main():
     ap.add_argument("--budget-min", type=int, default=300)
     ap.add_argument("--list", action="store_true", help="只列出分组统计")
     ap.add_argument("--probe-only", type=int, default=0, help="只转写前 N 秒做验证(不上传)")
+    ap.add_argument("--start-index", type=int, default=0, help="从待处理列表第 K 个开始(并行分批用)")
     a = ap.parse_args()
 
     if not SRC_REMOTE:
@@ -366,8 +367,13 @@ def main():
             print("  group parts=%d" % len(groups[b]))
         return
 
+    # 并行分批: 从第 start_index 个待处理组开始
+    if a.start_index > 0:
+        targets = targets[a.start_index:]
+        log("start-index=%d, 剩余可处理=%d" % (a.start_index, len(targets)))
     if a.limit_groups > 0:
         targets = targets[:a.limit_groups]
+    log("本批目标组: %d" % len(targets))
 
     workdir = tempfile.mkdtemp(prefix="subtr_")
     log("临时目录=%s" % workdir)
