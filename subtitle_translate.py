@@ -287,6 +287,40 @@ def write_srt(segs, path):
             f.write("%d\n%s --> %s\n%s\n\n" % (n, _fmt_ts(st), _fmt_ts(en), txt))
 
 
+# ---------------- 硬字幕烧制 ----------------
+BURN_VIDEO = os.environ.get("BURN_VIDEO", "1").strip() not in ("0", "false", "no", "off")
+BURN_DIR = os.environ.get("BURN_DIR", "字幕版")   # 输出子目录(相对源目录)
+# 烧制时字幕滤镜里要转义的字符(路径中的 : ' \ 等)
+def _ff_escape_path(p):
+    return p.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def burn_subtitles(video_path, srt_local, base, remote, path, gdir):
+    """把 srt 硬烧进整片, 输出 <番号>_字幕版.mp4, 上传到 <源目录>/字幕版/"""
+    out_mp4 = os.path.join(gdir, "burned.mp4")
+    vf = "subtitles='%s':force_style='FontName=Noto Sans CJK SC,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1,Shadow=0,MarginV=18'" % _ff_escape_path(srt_local)
+    log("开始烧制硬字幕(CPU 编码, 较慢)...")
+    # 先试 -c:v copy 不行(烧字幕必须重编码), 直接 libx264 + 高质量
+    rc, out, err = run(["ffmpeg", "-y", "-i", video_path, "-vf", vf,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                        "-c:a", "copy", out_mp4])
+    if rc != 0 or not os.path.exists(out_mp4):
+        log("!! 硬字幕烧制失败: %s" % (err[-250:] if err else ""))
+        return False
+    log("烧制完成 -> %.1f MB" % (os.path.getsize(out_mp4) / 1048576.0))
+    burn_name = "%s_字幕版.mp4" % base
+    dst = "%s:%s/%s/%s" % (remote, path, BURN_DIR, burn_name)
+    rc2, o2, e2 = run(["rclone", "copyto", out_mp4, dst, "--retries", "3"])
+    log("上传硬字幕视频 -> rc=%d" % rc2)
+    if rc2 != 0:
+        log("!! 上传硬字幕视频失败: %s" % (e2[:200] if e2 else ""))
+    try:
+        os.remove(out_mp4)
+    except Exception:
+        pass
+    return rc2 == 0
+
+
 # ---------------- 主流程 ----------------
 def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0):
     log("处理组 (parts=%d, probe=%s)" % (len(parts), probe_seconds or "off"))
@@ -320,6 +354,12 @@ def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0):
     log("上传 srt -> rc=%d (%.1fs)" % (rc, time.time() - t0))
     if rc != 0:
         log("!! 上传失败: %s" % err[:200])
+    # 硬字幕(可选): 把 srt 烧进整片, 上传到 字幕版/ 子目录
+    if BURN_VIDEO:
+        try:
+            burn_subtitles(video, srt_local, base, remote, path, gdir)
+        except Exception as e:
+            log("!! 硬字幕步骤异常: %s" % str(e)[:200])
     # 清理
     for p in local_parts + [video, srt_local]:
         try:
