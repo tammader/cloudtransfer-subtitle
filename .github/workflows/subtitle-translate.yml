@@ -77,10 +77,15 @@ jobs:
           test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
           grep -E '^\[' ~/.config/rclone/rclone.conf | sed 's/$/: <masked>/'
 
+      - name: 装 Python 3.11(av 12.x 有 cp311 预编译 wheel)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: 装 faster-whisper
         run: |
           python3 -m pip install --quiet --upgrade pip
-          # 锁定版本: 规避 open() got unexpected kwarg 'metadata_errors'(av/faster-whisper API 漂移)
+          # Python 3.11 + 有 wheel 的 av 版本; faster-whisper 锁 1.0.3 规避 metadata_errors 漂移
           python3 -m pip install --quiet "av==12.3.0" "faster-whisper==1.0.3" "ctranslate2==4.4.0"
           python3 -c "import faster_whisper, av, ctranslate2; print('fw', faster_whisper.__version__, '| av', av.__version__, '| ct2', ctranslate2.__version__)"
 
