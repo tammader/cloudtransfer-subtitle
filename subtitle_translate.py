@@ -322,8 +322,8 @@ def burn_subtitles(video_path, srt_local, base, remote, path, gdir):
 
 
 # ---------------- 主流程 ----------------
-def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0):
-    log("处理组 (parts=%d, probe=%s)" % (len(parts), probe_seconds or "off"))
+def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0, burn_only=False):
+    log("处理组 (parts=%d, probe=%s, burn_only=%s)" % (len(parts), probe_seconds or "off", burn_only))
     if not apply:
         return
     t0 = time.time()
@@ -333,6 +333,26 @@ def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0):
     video = os.path.join(gdir, "merged.mp4")
     concat_parts(local_parts, video)
     log("拼接完成 -> %.1f MB" % (os.path.getsize(video) / 1048576.0))
+
+    if burn_only:
+        # 补烧模式: 已有 srt, 只需下载 srt + 拼片 + 烧制, 跳过转写/翻译
+        srt_local = os.path.join(gdir, "existing.srt")
+        rc0, o0, e0 = run(["rclone", "copyto", "%s:%s/%s.srt" % (remote, path, base), srt_local, "--retries", "3"])
+        if rc0 != 0 or not os.path.exists(srt_local) or os.path.getsize(srt_local) < 10:
+            log("!! 补烧: 下载已有 srt 失败, 跳过")
+            for p in local_parts + [video]:
+                try: os.remove(p)
+                except Exception: pass
+            return
+        try:
+            burn_subtitles(video, srt_local, base, remote, path, gdir)
+        except Exception as e:
+            log("!! 补烧硬字幕异常: %s" % str(e)[:200])
+        for p in local_parts + [video, srt_local]:
+            try: os.remove(p)
+            except Exception: pass
+        return
+
     segs = transcribe(video, WHISPER_MODEL, max_seconds=probe_seconds)
     if probe_seconds:
         log("=== PROBE 结果: 前 %ds 收到 %d 条字幕 ===" % (probe_seconds, len(segs)))
@@ -378,6 +398,7 @@ def main():
     ap.add_argument("--probe-only", type=int, default=0, help="只转写前 N 秒做验证(不上传)")
     ap.add_argument("--start-index", type=int, default=0, help="从待处理列表第 K 个开始(并行分批用)")
     ap.add_argument("--force", action="store_true", help="配合 --only: 即使已有 srt 也强制重跑(测试硬字幕用)")
+    ap.add_argument("--burn-only", action="store_true", help="补烧模式: 对有 srt 但缺字幕版视频的组, 只拼片+烧制(不重跑转写)")
     a = ap.parse_args()
 
     if not SRC_REMOTE:
@@ -394,14 +415,35 @@ def main():
     # 已存在 srt 的组跳过(幂等)
     existing = set(f[:-4] for f in files if f.lower().endswith(".srt"))
 
-    targets = []
-    for base in sorted(groups.keys()):
-        if base in existing and not a.force:
-            continue
-        if a.only and base != a.only:
-            continue
-        targets.append(base)
-    log("待处理组=%d (已跳过 %d 个已有srt)" % (len(targets), len(existing)))
+    if a.burn_only:
+        # 补烧模式: 目标 = 有 srt 但 字幕版/ 里还没有对应 <番号>_字幕版.mp4 的组
+        burn_names = set()
+        try:
+            sub = rclone_lsf(SRC_REMOTE, "%s/%s" % (SRC_DIR, BURN_DIR))
+            for fn in sub:
+                if fn.lower().endswith(".mp4") and fn.endswith("_字幕版.mp4"):
+                    burn_names.add(fn[:-len("_字幕版.mp4")])
+        except Exception as e:
+            log("!! 列字幕版目录失败(可能不存在, 视为全缺): %s" % str(e)[:120])
+        targets = []
+        for base in sorted(groups.keys()):
+            if base not in existing:
+                continue  # 没 srt 的组不补烧(等正常流程出 srt)
+            if base in burn_names:
+                continue  # 已有硬字幕视频
+            if a.only and base != a.only:
+                continue
+            targets.append(base)
+        log("补烧模式: 有srt组=%d, 已有字幕版=%d, 待补烧=%d" % (len(existing), len(burn_names), len(targets)))
+    else:
+        targets = []
+        for base in sorted(groups.keys()):
+            if base in existing and not a.force:
+                continue
+            if a.only and base != a.only:
+                continue
+            targets.append(base)
+        log("待处理组=%d (已跳过 %d 个已有srt)" % (len(targets), len(existing)))
 
     if a.list:
         for b in targets:
@@ -425,7 +467,7 @@ def main():
             break
         try:
             process_group(SRC_REMOTE, SRC_DIR, base, groups[base], workdir, a.apply,
-                          probe_seconds=a.probe_only)
+                          probe_seconds=a.probe_only, burn_only=a.burn_only)
             ok += 1
         except Exception as e:
             fail += 1
