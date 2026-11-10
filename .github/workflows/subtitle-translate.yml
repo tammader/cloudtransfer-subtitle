@@ -31,6 +31,10 @@ on:
         description: "whisper 模型(large-v3 / medium / small)"
         required: false
         default: "large-v3"
+      probe_only:
+        description: "验证用: 只转写前 N 秒(如 120), 不上传; 0=正常全量"
+        required: false
+        default: "0"
 
 concurrency:
   group: subtitle-translate
@@ -99,11 +103,13 @@ jobs:
           LIMIT_GROUPS: ${{ inputs.limit_groups || '1' }}
           BUDGET_MIN: ${{ inputs.budget_min || '300' }}
           WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3' }}
+          PROBE_ONLY: ${{ inputs.probe_only || '0' }}
         run: |
           set -e
           ARGS="--limit-groups $LIMIT_GROUPS --budget-min $BUDGET_MIN"
           if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "$PROBE_ONLY" != "0" ]; then ARGS="$ARGS --probe-only $PROBE_ONLY"; fi
           python3 subtitle_translate.py $ARGS
 
       - name: 上传 srt 统计(可选)
