@@ -1,0 +1,101 @@
+name: subtitle-translate
+
+# 日文语音视频 → 中文 SRT 字幕(纯云端)
+#   分片按「番号」归组 → ffmpeg 拼整片 → faster-whisper(large-v3) 日文转写
+#   → OpenAI 兼容网关批量翻译(简体中文, 保时间轴) → 同名 .srt 上传回源目录
+#
+# 公开仓库: 日志全部脱敏(logmask), 真实盘名/目录名/番号/链接均不出现明文。
+# Secrets: RCLONE_CONF(含源远端) / PATHS_JSON(SUB_SRC/SUB_DIR/_WORDS) /
+#          SUBTITLE_API_BASE / SUBTITLE_API_KEY / SUBTITLE_MODEL / SUBTITLE_MODEL_FB
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真跑(转写+翻译+上传), false=只列分组统计"
+        required: false
+        default: "false"
+      only:
+        description: "只处理某一组(按番号, 留空=全部)"
+        required: false
+        default: ""
+      limit_groups:
+        description: "最多处理前 N 组(0=不限)"
+        required: false
+        default: "1"
+      budget_min:
+        description: "本轮时间预算(分钟)"
+        required: false
+        default: "300"
+      whisper_model:
+        description: "whisper 模型(large-v3 / medium / small)"
+        required: false
+        default: "large-v3"
+
+concurrency:
+  group: subtitle-translate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  SUBTITLE_API_BASE: ${{ secrets.SUBTITLE_API_BASE }}
+  SUBTITLE_API_KEY: ${{ secrets.SUBTITLE_API_KEY }}
+  SUBTITLE_MODEL: ${{ secrets.SUBTITLE_MODEL }}
+  SUBTITLE_MODEL_FB: ${{ secrets.SUBTITLE_MODEL_FB }}
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装系统依赖(ffmpeg)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+          df -h / | tail -1
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
+          grep -E '^\[' ~/.config/rclone/rclone.conf | sed 's/$/: <masked>/'
+
+      - name: 装 faster-whisper
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet faster-whisper
+
+      - name: 跑字幕流水线
+        env:
+          APPLY: ${{ inputs.apply || 'false' }}
+          ONLY: ${{ inputs.only || '' }}
+          LIMIT_GROUPS: ${{ inputs.limit_groups || '1' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '300' }}
+          WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3' }}
+        run: |
+          set -e
+          ARGS="--limit-groups $LIMIT_GROUPS --budget-min $BUDGET_MIN"
+          if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          python3 subtitle_translate.py $ARGS
+
+      - name: 上传 srt 统计(可选)
+        if: always()
+        run: df -h / | tail -1
