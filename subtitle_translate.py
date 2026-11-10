@@ -168,8 +168,9 @@ def transcribe(video_path, whisper_model, max_seconds=0):
             kw["clip_timestamps"] = "0,%d" % max_seconds
         if use_vad:
             kw["vad_filter"] = True
-            kw["vad_parameters"] = {"min_silence_duration_ms": 500, "threshold": 0.3,
-                                    "min_speech_duration_ms": 100, "speech_pad_ms": 200}
+            # 放宽 VAD: 这类片对白稀疏, 阈值过高会把对白整段滤掉(实测 long-audio 出 0 条)
+            kw["vad_parameters"] = {"min_silence_duration_ms": 2000, "threshold": 0.15,
+                                    "min_speech_duration_ms": 50, "speech_pad_ms": 400}
         else:
             kw["vad_filter"] = False
         segments, info = model.transcribe(video_path, **kw)
