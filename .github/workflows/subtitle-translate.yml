@@ -47,6 +47,10 @@ on:
         description: "true=额外烧制硬字幕 mp4(上传到 字幕版/ 子目录); false=只出 srt"
         required: false
         default: "true"
+      force:
+        description: "配合 only: 即使已有 srt 也强制重跑(测试用, 慎用)"
+        required: false
+        default: "false"
 
 concurrency:
   # 按 batch_tag 唯一, 允许多批并行跑不同组(不会互相取消); cancel-in-progress 仍关
@@ -120,6 +124,7 @@ jobs:
           PROBE_ONLY: ${{ inputs.probe_only || '0' }}
           START_INDEX: ${{ inputs.start_index || '0' }}
           BURN_VIDEO: ${{ inputs.burn_video || 'true' }}
+          FORCE: ${{ inputs.force || 'false' }}
         run: |
           set -e
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
@@ -128,6 +133,7 @@ jobs:
           if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
           if [ "$PROBE_ONLY" != "0" ]; then ARGS="$ARGS --probe-only $PROBE_ONLY"; fi
+          if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
           python3 subtitle_translate.py $ARGS
 
       - name: 上传 srt 统计(可选)
