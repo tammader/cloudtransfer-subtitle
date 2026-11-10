@@ -122,22 +122,35 @@ def download_group(remote, path, base, parts, workdir):
 
 
 def concat_parts(local_parts, outpath):
-    """用 ffmpeg concat demuxer 把分片按序拼成整片"""
+    """用 ffmpeg concat demuxer 把分片按序拼成整片; 校验/重编码音频确保音轨可用"""
     if len(local_parts) == 1:
         shutil.copyfile(local_parts[0], outpath)
-        return outpath
-    lst = outpath + ".txt"
-    with io.open(lst, "w", encoding="utf-8") as f:
-        for p in local_parts:
-            f.write("file '%s'\n" % p.replace("'", "'\\''"))
-    rc, out, err = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
-                        "-c", "copy", outpath])
-    if rc != 0 or not os.path.exists(outpath):
-        # 回退: 重新编码拼接(容器不一致时)
-        rc2, out2, err2 = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
-                               "-c:v", "libx264", "-c:a", "aac", outpath])
-        if rc2 != 0:
-            raise RuntimeError("ffmpeg 拼接失败: %s / %s" % (err[-200:], err2[-200:]))
+    else:
+        lst = outpath + ".txt"
+        with io.open(lst, "w", encoding="utf-8") as f:
+            for p in local_parts:
+                f.write("file '%s'\n" % p.replace("'", "'\\''"))
+        rc, out, err = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                            "-c", "copy", outpath])
+        if rc != 0 or not os.path.exists(outpath):
+            rc2, out2, err2 = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                                   "-c:v", "libx264", "-c:a", "aac", outpath])
+            if rc2 != 0:
+                raise RuntimeError("ffmpeg 拼接失败: %s / %s" % (err[-200:], err2[-200:]))
+    # 校验音轨: 无音轨 / 音频异常时, 用统一 16k 单声道 wav 作为转写输入
+    rc, out, err = run(["ffprobe", "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=codec_name,channels,sample_rate",
+                        "-of", "csv=p=0", outpath])
+    has_audio = rc == 0 and out.strip() != ""
+    log("音轨检测: %s" % (out.strip() if has_audio else "无音轨!"))
+    if has_audio:
+        wav = outpath + ".wav"
+        rc2, o2, e2 = run(["ffmpeg", "-y", "-i", outpath, "-vn", "-ac", "1", "-ar", "16000",
+                           "-c:a", "pcm_s16le", wav])
+        if rc2 == 0 and os.path.exists(wav) and os.path.getsize(wav) > 1024:
+            log("已抽出声轨 wav -> %.1f MB" % (os.path.getsize(wav) / 1048576.0))
+            return wav
+        log("!! 抽音轨失败, 直接用原视频: %s" % (e2[-150:] if e2 else ""))
     return outpath
 
 
@@ -147,17 +160,29 @@ def transcribe(video_path, whisper_model):
     from faster_whisper import WhisperModel
     log("加载 whisper 模型 %s (CPU int8)..." % whisper_model)
     model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
-    log("开始转写(日文)...")
-    segments, info = model.transcribe(
-        video_path, language="ja", beam_size=5,
-        vad_filter=True, vad_parameters={"min_silence_duration_ms": 500},
-    )
-    log("检测语种=%s p=%.2f, 时长=%.1fs" % (info.language, info.language_probability, info.duration))
-    out = []
-    for seg in segments:
-        txt = (seg.text or "").strip()
-        if txt:
-            out.append((seg.start, seg.end, txt))
+
+    def _run(use_vad):
+        log("开始转写(日文, vad=%s)..." % use_vad)
+        kw = dict(language="ja", beam_size=5, condition_on_previous_text=False)
+        if use_vad:
+            kw["vad_filter"] = True
+            kw["vad_parameters"] = {"min_silence_duration_ms": 500, "threshold": 0.3,
+                                    "min_speech_duration_ms": 100, "speech_pad_ms": 200}
+        else:
+            kw["vad_filter"] = False
+        segments, info = model.transcribe(video_path, **kw)
+        log("检测语种=%s p=%.2f, 时长=%.1fs" % (info.language, info.language_probability, info.duration))
+        out = []
+        for seg in segments:
+            txt = (seg.text or "").strip()
+            if txt:
+                out.append((seg.start, seg.end, txt))
+        return out
+
+    out = _run(True)
+    if not out:
+        log("!! VAD 后无字幕, 回退到无 VAD 重转写")
+        out = _run(False)
     log("转写完成: %d 条字幕" % len(out))
     return out
 
