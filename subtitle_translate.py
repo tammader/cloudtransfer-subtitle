@@ -377,6 +377,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出分组统计")
     ap.add_argument("--probe-only", type=int, default=0, help="只转写前 N 秒做验证(不上传)")
     ap.add_argument("--start-index", type=int, default=0, help="从待处理列表第 K 个开始(并行分批用)")
+    ap.add_argument("--force", action="store_true", help="配合 --only: 即使已有 srt 也强制重跑(测试硬字幕用)")
     a = ap.parse_args()
 
     if not SRC_REMOTE:
@@ -395,7 +396,7 @@ def main():
 
     targets = []
     for base in sorted(groups.keys()):
-        if base in existing:
+        if base in existing and not a.force:
             continue
         if a.only and base != a.only:
             continue
