@@ -237,7 +237,7 @@ def _extract_json_array(text):
 def _translate_batch(payload):
     """翻译一批 [{i,t}], 返回 {i: zh}; 多模型+多重试, 全失败返回 None"""
     user = json.dumps(payload, ensure_ascii=False)
-    models = [MODEL, MODEL_FB, "qwen3.8-max", "deepseek-v4-pro"]
+    models = [MODEL, MODEL_FB, "qwen3.7-max", "qwen3.8-max", "deepseek-v4-pro"]
     for model in models:
         for attempt in range(4):
             try:
@@ -283,21 +283,37 @@ def _has_japanese(text):
     return bool(re.search(r"[\u3040-\u309f\u30a0-\u30ff]", text or ""))
 
 
-def _retranslate_japanese(result, rounds=3):
-    """结果里仍含日文的条目, 重新翻译, 直到无日文或轮次用尽"""
+_LEAK_WORDS = ("the user", "i need", "i should", "let me", "translate", "translation",
+               "用户想", "用户希望", "需要翻译", "翻译成", "we need", "sure,", "当然，以下是")
+def _is_bad_translation(text):
+    """坏译文: 含日文假名 / 泄漏思考过程 / 为空"""
+    t = (text or "").strip()
+    if not t:
+        return True
+    if _has_japanese(t):
+        return True
+    low = t.lower()
+    for w in _LEAK_WORDS:
+        if w in low:
+            return True
+    return False
+
+
+def _retranslate_bad(result, rounds=3):
+    """结果里仍是坏译文(日文/泄漏思考/空)的条目, 重新翻译, 直到合格或轮次用尽"""
     for rd in range(rounds):
-        bad = [(i, r[2]) for i, r in enumerate(result) if _has_japanese(r[2])]
+        bad = [(i, r[2]) for i, r in enumerate(result) if _is_bad_translation(r[2])]
         if not bad:
             return result
-        log("第%d轮补译: %d 条仍含日文" % (rd + 1, len(bad)))
+        log("第%d轮补译: %d 条坏译文(日文/泄漏/空)" % (rd + 1, len(bad)))
         got = _translate_items(bad)
         for i, _ in bad:
             zh = got.get(i)
-            if zh and not _has_japanese(zh):
+            if zh and not _is_bad_translation(zh):
                 result[i] = (result[i][0], result[i][1], zh)
-    still = sum(1 for r in result if _has_japanese(r[2]))
+    still = sum(1 for r in result if _is_bad_translation(r[2]))
     if still:
-        log("!! 补译后仍有 %d 条含日文" % still)
+        log("!! 补译后仍有 %d 条坏译文" % still)
     return result
 
 
@@ -316,8 +332,8 @@ def translate_segments(segs):
                 zh = b[2]  # 极端兜底: 只有单条也彻底失败才会到这里
             result[gi] = (b[0], b[1], zh)
         log("翻译进度 %d/%d" % (min(bs + BATCH_SIZE, total), total))
-    # 收尾: 补译所有仍含日文的条目
-    result = _retranslate_japanese(result)
+    # 收尾: 补译所有坏译文(日文残留/泄漏思考/空)
+    result = _retranslate_bad(result)
     return result
 
 
@@ -429,11 +445,11 @@ def fix_srt_group(remote, path, base, parts, workdir, apply, re_burn=True):
     log("解析 srt: %d 条" % len(segs))
     if not segs:
         return
-    ja_before = sum(1 for _, _, t in segs if _has_japanese(t))
-    log("含日文条数(修前): %d/%d" % (ja_before, len(segs)))
+    ja_before = sum(1 for _, _, t in segs if _is_bad_translation(t))
+    log("坏译文条数(修前, 日文/泄漏/空): %d/%d" % (ja_before, len(segs)))
     zh = translate_segments(segs)
-    ja_after = sum(1 for _, _, t in zh if _has_japanese(t))
-    log("含日文条数(修后): %d/%d" % (ja_after, len(zh)))
+    ja_after = sum(1 for _, _, t in zh if _is_bad_translation(t))
+    log("坏译文条数(修后): %d/%d" % (ja_after, len(zh)))
     out_srt = os.path.join(gdir, "fixed.srt")
     write_srt(zh, out_srt)
     rc, out, err = run(["rclone", "copyto", out_srt, "%s:%s/%s.srt" % (remote, path, base), "--retries", "3"])
