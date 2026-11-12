@@ -84,27 +84,21 @@ def run(cmd, **kw):
 
 # ---------------- rclone / 文件分组 ----------------
 def rclone_lsf(remote, path):
-    """返回 [(文件名, 字节大小), ...]"""
-    rc, out, err = run(["rclone", "lsf", "%s:%s" % (remote, path),
-                        "--files-only", "--max-depth", "1", "--format", "ps"])
+    """返回 [(文件名, 字节大小), ...]  —— 用 lsjson, 避免 lsf 分隔符歧义"""
+    import json as _json
+    rc, out, err = run(["rclone", "lsjson", "%s:%s" % (remote, path),
+                        "--files-only", "--max-depth", "1"])
     if rc != 0:
-        raise SystemExit("rclone lsf 失败: %s" % err[:300])
+        raise SystemExit("rclone lsjson 失败: %s" % err[:300])
+    try:
+        arr = _json.loads(out) if out.strip() else []
+    except Exception:
+        arr = []
     res = []
-    for line in out.splitlines():
-        line = line.rstrip()
-        if not line:
+    for it in arr:
+        if it.get("IsDir"):
             continue
-        # 格式: "<size>;<path>" (rclone --format ps)
-        if ";" in line:
-            sz, fn = line.split(";", 1)
-            try:
-                szn = int(sz)
-            except Exception:
-                szn = 0
-            res.append((fn.strip(), szn))
-        else:
-            # 兼容旧格式(只有名字)
-            res.append((line.strip(), 0))
+        res.append((it.get("Name", ""), int(it.get("Size", 0) or 0)))
     return res
 
 
