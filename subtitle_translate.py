@@ -84,16 +84,35 @@ def run(cmd, **kw):
 
 # ---------------- rclone / 文件分组 ----------------
 def rclone_lsf(remote, path):
-    rc, out, err = run(["rclone", "lsf", "%s:%s" % (remote, path), "--files-only", "--max-depth", "1"])
+    """返回 [(文件名, 字节大小), ...]"""
+    rc, out, err = run(["rclone", "lsf", "%s:%s" % (remote, path),
+                        "--files-only", "--max-depth", "1", "--format", "ps"])
     if rc != 0:
         raise SystemExit("rclone lsf 失败: %s" % err[:300])
-    return [l.strip() for l in out.splitlines() if l.strip()]
+    res = []
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        # 格式: "<size>;<path>" (rclone --format ps)
+        if ";" in line:
+            sz, fn = line.split(";", 1)
+            try:
+                szn = int(sz)
+            except Exception:
+                szn = 0
+            res.append((fn.strip(), szn))
+        else:
+            # 兼容旧格式(只有名字)
+            res.append((line.strip(), 0))
+    return res
 
 
 def group_files(files):
-    """把分片按 base 归组 -> {base: [(idx, fname), ...]}；非分片单独成组"""
+    """files: [(fn, size) 或 fn] -> {base: [(idx, fname), ...]}; 兼容纯名单"""
     groups = {}
-    for fn in files:
+    for item in files:
+        fn = item[0] if isinstance(item, (tuple, list)) else item
         m = _RE_PART.search(fn)
         if m:
             base = m.group("base")
@@ -107,6 +126,18 @@ def group_files(files):
     for b in groups:
         groups[b].sort(key=lambda x: x[0])
     return groups
+
+
+def group_sizes(files, groups):
+    """{base: 总字节大小}; files=[(fn,size)]"""
+    sz = {}
+    sizemap = {fn: s for fn, s in files if isinstance((fn, s), tuple)} if files and isinstance(files[0], (tuple, list)) else {}
+    for base, parts in groups.items():
+        tot = 0
+        for _idx, fn in parts:
+            tot += sizemap.get(fn, 0)
+        sz[base] = tot
+    return sz
 
 
 def download_group(remote, path, base, parts, workdir):
@@ -561,23 +592,27 @@ def main():
     files = rclone_lsf(SRC_REMOTE, SRC_DIR)
     log("目录内文件数=%d" % len(files))
     groups = group_files(files)
+    gsizes = group_sizes(files, groups)
     log("归组后=%d 组" % len(groups))
 
     # 已存在 srt 的组跳过(幂等)
-    existing = set(f[:-4] for f in files if f.lower().endswith(".srt"))
+    existing = set(fn[:-4] for fn, _sz in files if fn.lower().endswith(".srt"))
+
+    # 目标顺序: 按组总大小升序(小的先做, 巨型文件排最后, 避免阻塞)
+    order_by_size = sorted(groups.keys(), key=lambda b: gsizes.get(b, 0))
 
     if a.burn_only:
         # 补烧模式: 目标 = 有 srt 但 字幕版/ 里还没有对应 <番号>_字幕版.mp4 的组
         burn_names = set()
         try:
             sub = rclone_lsf(SRC_REMOTE, "%s/%s" % (SRC_DIR, BURN_DIR))
-            for fn in sub:
+            for fn, _sz in sub:
                 if fn.lower().endswith(".mp4") and fn.endswith("_字幕版.mp4"):
                     burn_names.add(fn[:-len("_字幕版.mp4")])
         except Exception as e:
             log("!! 列字幕版目录失败(可能不存在, 视为全缺): %s" % str(e)[:120])
         targets = []
-        for base in sorted(groups.keys()):
+        for base in order_by_size:
             if base not in existing:
                 continue  # 没 srt 的组不补烧(等正常流程出 srt)
             if base in burn_names:
@@ -589,7 +624,7 @@ def main():
     elif a.fix_srt:
         # 修复模式: 扫描有 srt 的组(可按 --only 限定), 重译日文残留
         targets = []
-        for base in sorted(groups.keys()):
+        for base in order_by_size:
             if base not in existing:
                 continue
             if a.only and base != a.only:
@@ -598,13 +633,13 @@ def main():
         log("修复模式: 有srt组=%d, 目标=%d" % (len(existing), len(targets)))
     else:
         targets = []
-        for base in sorted(groups.keys()):
+        for base in order_by_size:
             if base in existing and not a.force:
                 continue
             if a.only and base != a.only:
                 continue
             targets.append(base)
-        log("待处理组=%d (已跳过 %d 个已有srt)" % (len(targets), len(existing)))
+        log("待处理组=%d (已跳过 %d 个已有srt; 按大小升序)" % (len(targets), len(existing)))
 
     if a.list:
         for b in targets:
