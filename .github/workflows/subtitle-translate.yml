@@ -9,6 +9,10 @@ name: subtitle-translate
 #          SUBTITLE_API_BASE / SUBTITLE_API_KEY / SUBTITLE_MODEL / SUBTITLE_MODEL_FB
 
 on:
+  # 定时自动跑一批(不依赖会话在线)。每 6 小时一次, 每次处理 1 组(medium+硬字幕)。
+  # 已有 srt 的组自动跳过(幂等), 所以每次都取当前最前面的未处理组。
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -28,9 +32,9 @@ on:
         required: false
         default: "300"
       whisper_model:
-        description: "whisper 模型(large-v3 / medium / small)"
+        description: "whisper 模型(medium / large-v3 / small); 默认 medium 更快"
         required: false
-        default: "large-v3"
+        default: "medium"
       probe_only:
         description: "验证用: 只转写前 N 秒(如 120), 不上传; 0=正常全量"
         required: false
@@ -128,11 +132,12 @@ jobs:
 
       - name: 跑字幕流水线
         env:
+          EVENT_NAME: ${{ github.event_name }}
           APPLY: ${{ inputs.apply || 'false' }}
           ONLY: ${{ inputs.only || '' }}
           LIMIT_GROUPS: ${{ inputs.limit_groups || '1' }}
           BUDGET_MIN: ${{ inputs.budget_min || '300' }}
-          WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3' }}
+          WHISPER_MODEL: ${{ inputs.whisper_model || 'medium' }}
           PROBE_ONLY: ${{ inputs.probe_only || '0' }}
           START_INDEX: ${{ inputs.start_index || '0' }}
           BURN_VIDEO: ${{ inputs.burn_video || 'true' }}
@@ -142,6 +147,12 @@ jobs:
           NO_REBURN: ${{ inputs.no_reburn || 'false' }}
         run: |
           set -e
+          # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, medium, 硬字幕)
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            APPLY="true"; LIMIT_GROUPS="1"; WHISPER_MODEL="medium"; START_INDEX="0"
+            BURN_VIDEO="true"; ONLY=""
+            echo "(定时触发: 处理1组 medium+硬字幕)"
+          fi
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
           export BURN_VIDEO="$BURN_VIDEO"
           ARGS="--limit-groups $LIMIT_GROUPS --budget-min $BUDGET_MIN --start-index $START_INDEX"
