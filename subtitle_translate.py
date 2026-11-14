@@ -5,7 +5,7 @@
   1. 列出源远端(如 gdrive6)目标目录(默认 out3)的 mp4 分片
   2. 按「番号」归组(去掉 已处理_ 前缀 / .partNNN_D 后缀)
   3. 每组的 .partNNN 分片按序号用 ffmpeg concat 拼成整片(单分片直接拷)
-  4. faster-whisper (large-v3) 做日文语音转写 -> 日文 srt 段
+  4. faster-whisper (large-v3-turbo) 做日文语音转写 -> 日文 srt 段
   5. 调 OpenAI 兼容翻译网关, 每 N 条一批译成简体中文(保留时间轴)
   6. 写中文 .srt, 上传回源远端同目录, 文件名 = <番号>.srt
   7. run 结束前清理本地临时文件(可选)
@@ -26,7 +26,7 @@
   SUBTITLE_API_KEY  翻译网关 key
   SUBTITLE_MODEL    主模型, 如 glm-5.3
   SUBTITLE_MODEL_FB 备用模型, 如 qwen3.8-max
-  WHISPER_MODEL     默认 large-v3
+  WHISPER_MODEL     默认 large-v3-turbo(别名 turbo 亦可; 也接受 medium/large-v3/small)
   BATCH_SIZE        每批翻译条数, 默认 40
   BUDGET_MIN        本轮时间预算(分钟)
 """
@@ -63,7 +63,23 @@ API_BASE = os.environ.get("SUBTITLE_API_BASE", "").rstrip("/")
 API_KEY = os.environ.get("SUBTITLE_API_KEY", "")
 MODEL = os.environ.get("SUBTITLE_MODEL", "glm-5.3")
 MODEL_FB = os.environ.get("SUBTITLE_MODEL_FB", "qwen3.8-max")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
+# whisper 模型: 默认 large-v3-turbo(编码器=large-v3, 解码器4层; 精度接近 large-v3, 速度 4-5x)
+#   兼容口径: 接受 "large-v3-turbo" / "turbo" 等别名, 内部映射到 HF 上可直连下载的 CT2 仓库
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+# 别名 -> HF 仓库(仅当传入的是别名而非真实路径/仓库时使用)
+_WHISPER_ALIAS = {
+    "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "large-v3_turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "large-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
+
+def resolve_whisper_model(name):
+    """把 whisper 模型别名解析成可直接加载的标识。
+    'large-v3-turbo'/'turbo' 等别名 -> HF CT2 仓库; 其它(medium/large-v3/small/本地路径)原样返回。"""
+    key = (name or "").strip().lower()
+    return _WHISPER_ALIAS.get(key, name)
 # --- 速度旋钮(都可用仓库 Variables 覆盖, 不改代码) ---
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))        # 每请求条数: 10 -> 50
 XLATE_CONC = int(os.environ.get("XLATE_CONC", "4"))        # 并发翻译请求数(网关 503 敏感, 别超 6)
@@ -77,6 +93,17 @@ BURN_MODE = os.environ.get("BURN_MODE", "hard")            # hard=烧进画面 /
 # 分片命名: [已处理_]<base>.partNNN[_D].mp4  ；<base> 可能含中文/番号/空格
 _RE_PART = re.compile(r"(?:^|_)(?P<base>.+?)\.part(?P<idx>\d+)(?:_[A-Za-z])?\.(?P<ext>mp4|mkv|avi|wmv|mov|flv|m4v|rmvb|ts|mpg|mpeg|webm|3gp)$", re.I)
 _RE_PLAIN = re.compile(r"(?:^|_)(?P<base>.+?)\.(?P<ext>mp4|mkv|avi|wmv|mov|flv|m4v|rmvb|ts|mpg|mpeg|webm|3gp)$", re.I)
+
+
+def _norm_base(base):
+    """归一化组名: 剥掉 已处理_ 前缀(可能多个), 让同番号的已处理/未处理分片归为一组。"""
+    b = base
+    while True:
+        nb = re.sub(r"^已处理_", "", b)
+        if nb == b:
+            break
+        b = nb
+    return b
 
 
 def now_ts():
@@ -120,13 +147,13 @@ def group_files(files):
         fn = item[0] if isinstance(item, (tuple, list)) else item
         m = _RE_PART.search(fn)
         if m:
-            base = m.group("base")
+            base = _norm_base(m.group("base"))
             idx = int(m.group("idx"))
             groups.setdefault(base, []).append((idx, fn))
         else:
             mp = _RE_PLAIN.search(fn)
             if mp:
-                groups.setdefault(mp.group("base"), []).append((0, fn))
+                groups.setdefault(_norm_base(mp.group("base")), []).append((0, fn))
     # 排序每个组内分片
     for b in groups:
         groups[b].sort(key=lambda x: x[0])
@@ -210,8 +237,10 @@ def transcribe(video_path, whisper_model, max_seconds=0):
     VAD 空结果时先"放宽 VAD"重跑, 最后才全量无 VAD —— 不再一上来就跑两遍全片。
     """
     from faster_whisper import WhisperModel, BatchedInferencePipeline
-    log("加载 whisper 模型 %s (CPU int8, threads=%d)..." % (whisper_model, WHISPER_THREADS))
-    model = WhisperModel(whisper_model, device="cpu", compute_type="int8",
+    resolved = resolve_whisper_model(whisper_model)
+    log("加载 whisper 模型 %s (解析=%s, CPU int8, threads=%d)..." % (
+        whisper_model, resolved, WHISPER_THREADS))
+    model = WhisperModel(resolved, device="cpu", compute_type="int8",
                          cpu_threads=WHISPER_THREADS, num_workers=1)
     pipe = BatchedInferencePipeline(model=model)
 
@@ -276,9 +305,58 @@ def _post_chat(model, messages, timeout=120):
     return d["choices"][0]["message"]["content"]
 
 
-_SYS = ("你是专业的日译中字幕翻译。你会收到一个 JSON 数组, 每个元素是 {i, t} 字幕条目。"
-        "请把每条 t 从日文翻译成简洁自然的简体中文, 保持口语化、符合字幕习惯。"
-        "严格只返回一个 JSON 数组, 每个元素 {\"i\": 原i, \"z\": 中文译文}, 顺序与输入一致, 不要任何解释或多余文字。")
+# --- 翻译可定制规则 ---
+# 三条来源(优先级从高到低叠加): 环境变量 EXTRA_RULES(CI 输入/vars) + 术语表文件 TERMS_FILE(JSON)
+# 用法: 手动 dispatch 填 extra_rules, 或把仓库变量 TRANSLATE_RULES 设成固定文案; 术语表放源目录同层
+EXTRA_RULES = (os.environ.get("EXTRA_RULES") or "").strip()
+TERMS_FILE = (os.environ.get("TERMS_FILE") or "translate_terms.json").strip()
+
+_BASE_SYS = ("你是专业的日译中字幕翻译。你会收到一个 JSON 数组, 每个元素是 {i, t} 字幕条目。"
+             "请把每条 t 从日文翻译成简洁自然的简体中文, 保持口语化、符合字幕习惯。"
+             "严格只返回一个 JSON 数组, 每个元素 {\"i\": 原i, \"z\": 中文译文}, 顺序与输入一致, 不要任何解释或多余文字。")
+
+
+def _load_terms_text():
+    """从术语表文件读取 {日文原文: 中文译法}, 拼成"术语对照"附加规则。找不到/解析失败返回空。"""
+    if not TERMS_FILE:
+        return ""
+    path = TERMS_FILE
+    if not os.path.isabs(path):
+        # 优先当前工作目录, 其次脚本目录
+        cand = os.path.join(os.getcwd(), path)
+        if not os.path.exists(cand):
+            cand = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        path = cand
+    if not os.path.exists(path):
+        return ""
+    try:
+        # utf-8-sig 兼容 Windows 记事本/PowerShell 写入的 BOM
+        data = json.loads(io.open(path, encoding="utf-8-sig").read())
+        if not isinstance(data, dict):
+            return ""
+        pairs = ["%s => %s" % (str(k), str(v)) for k, v in data.items() if str(k).strip()]
+        if not pairs:
+            return ""
+        return "以下是必须遵守的术语/专有名词对照(遇到即按此译法, 勿自行意译):\n" + "\n".join(pairs)
+    except Exception as e:
+        log("!! 术语表解析失败(%s): %s" % (TERMS_FILE, str(e)[:120]))
+        return ""
+
+
+def _build_sys():
+    """组合默认规则 + 术语表 + 用户附加规则, 生成最终系统提示词。"""
+    parts = [_BASE_SYS]
+    terms = _load_terms_text()
+    if terms:
+        parts.append(terms)
+    if EXTRA_RULES:
+        parts.append("额外翻译规则(必须严格遵守):\n" + EXTRA_RULES)
+    if len(parts) > 1:
+        parts.append("上面所有规则都必须遵守; 输出格式仍然严格遵循: 只返回 JSON 数组 [{\"i\":..,\"z\":..}]。")
+    return "\n\n".join(parts)
+
+
+_SYS = _build_sys()
 
 
 def _extract_json_array(text):
@@ -665,6 +743,10 @@ def main():
 
     deadline = time.time() + a.budget_min * 60
     log("源=%s:%s | 翻译模型=%s | whisper=%s | apply=%s" % (SRC_REMOTE, SRC_DIR, MODEL, WHISPER_MODEL, a.apply))
+    _terms = _load_terms_text()
+    log("翻译规则: 附加规则=%s, 术语表=%s" % (
+        "有(%d字)" % len(EXTRA_RULES) if EXTRA_RULES else "无",
+        "有(%d条)" % (_terms.count("=>") if _terms else 0) if _terms else "无"))
 
     files = rclone_lsf(SRC_REMOTE, SRC_DIR)
     log("目录内文件数=%d" % len(files))
