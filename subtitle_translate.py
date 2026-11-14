@@ -316,8 +316,29 @@ _BASE_SYS = ("你是专业的日译中字幕翻译。你会收到一个 JSON 数
              "严格只返回一个 JSON 数组, 每个元素 {\"i\": 原i, \"z\": 中文译文}, 顺序与输入一致, 不要任何解释或多余文字。")
 
 
+def _terms_to_text(data):
+    """{日文原文: 中文译法} -> "术语对照"附加规则文本; 非 dict / 空则返回空串。"""
+    if not isinstance(data, dict):
+        return ""
+    pairs = ["%s => %s" % (str(k), str(v)) for k, v in data.items() if str(k).strip()]
+    if not pairs:
+        return ""
+    return "以下是必须遵守的术语/专有名词对照(遇到即按此译法, 勿自行意译):\n" + "\n".join(pairs)
+
+
 def _load_terms_text():
-    """从术语表文件读取 {日文原文: 中文译法}, 拼成"术语对照"附加规则。找不到/解析失败返回空。"""
+    """术语对照来源优先级: 环境变量 TRANSLATE_TERMS(JSON 文本, CI 走 Secret) > 本地文件 TERMS_FILE。
+    找不到/解析失败返回空(不阻断流程)。"""
+    # 1) CI Secret 注入的 JSON 文本(不落进公开仓库)
+    env_raw = (os.environ.get("TRANSLATE_TERMS") or "").strip()
+    if env_raw:
+        try:
+            txt = _terms_to_text(json.loads(env_raw))
+            if txt:
+                return txt
+        except Exception as e:
+            log("!! 术语表(env TRANSLATE_TERMS)解析失败: %s" % str(e)[:120])
+    # 2) 本地/仓库文件兜底
     if not TERMS_FILE:
         return ""
     path = TERMS_FILE
@@ -331,13 +352,7 @@ def _load_terms_text():
         return ""
     try:
         # utf-8-sig 兼容 Windows 记事本/PowerShell 写入的 BOM
-        data = json.loads(io.open(path, encoding="utf-8-sig").read())
-        if not isinstance(data, dict):
-            return ""
-        pairs = ["%s => %s" % (str(k), str(v)) for k, v in data.items() if str(k).strip()]
-        if not pairs:
-            return ""
-        return "以下是必须遵守的术语/专有名词对照(遇到即按此译法, 勿自行意译):\n" + "\n".join(pairs)
+        return _terms_to_text(json.loads(io.open(path, encoding="utf-8-sig").read()))
     except Exception as e:
         log("!! 术语表解析失败(%s): %s" % (TERMS_FILE, str(e)[:120]))
         return ""
