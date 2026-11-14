@@ -9,7 +9,9 @@ name: subtitle-dispatch
 on:
   schedule:
     # 每 10 分钟补一次(旧 30 分钟窗口太大: 单批 5-20 分钟就跑完, 大半时间空转)
-    - cron: "*/10 * * * *"
+    # 错峰: 避开 :00/:15/:30/:45 —— 同账号下另外 31 个定时 workflow 集中在这几个分钟点,
+    #       20 并发额度是账号级共享的, 撞一起会让本流程的 run 排队变慢。
+    - cron: "8,18,28,38,48,58 * * * *"
   workflow_dispatch: {}
 
 concurrency:
