@@ -185,3 +185,19 @@ jobs:
       - name: 上传 srt 统计(可选)
         if: always()
         run: df -h / | tail -1
+
+      # 自接力: 本批干完立刻补满并行(不依赖 GitHub cron —— 实测 cron 会数小时不响)。
+      # subtitle_dispatch.py 自带闸门: 活跃 run < 6 才补发, 待处理=0 时只发一次完成通知;
+      # 当前任务此刻仍是 in_progress, 所以会被算进活跃数, 不会自己刷自己。
+      - name: 自接力补满并行
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          # 随机错峰 0-25s, 避免多批同时收尾时一起 dispatch 造成重复补发
+          sleep $((RANDOM % 25))
+          python3 subtitle_dispatch.py
+
