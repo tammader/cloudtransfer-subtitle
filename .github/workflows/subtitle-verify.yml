@@ -1,0 +1,61 @@
+name: subtitle-verify
+
+# 字幕质量校验(第二段的前置关卡): 扫描源目录所有 .srt, 逐条查
+#   日文残留 / 思考过程泄漏 / 空条目, 汇总成报告发 Telegram。
+# 手动跑一次即可确认"翻译没问题"; 烧录阶段(subtitle-burn)会自己再闸门一次。
+# Secrets: RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
+
+on:
+  schedule:
+    # 每 6 小时一次(错峰到 :17, 与 translate :23 / report :43 / dispatch :08.. 都不撞)
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      max_bad_file_ratio:
+        description: "允许的'有问题的 srt 文件'占比上限(0.02 = 2%)"
+        required: false
+        default: "0.02"
+      max_bad_seg_ratio:
+        description: "允许的'坏条目'占比上限(0.05 = 5%)"
+        required: false
+        default: "0.05"
+
+concurrency:
+  group: subtitle-verify
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: 校验 srt 质量并发报告
+        run: |
+          python3 verify_srt.py --tg \
+            --max-bad-file-ratio "${{ inputs.max_bad_file_ratio || '0.02' }}" \
+            --max-bad-seg-ratio "${{ inputs.max_bad_seg_ratio || '0.05' }}"
