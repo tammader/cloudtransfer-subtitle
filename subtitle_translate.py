@@ -35,14 +35,17 @@ import datetime
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pathcfg
 import logmask
@@ -61,7 +64,15 @@ API_KEY = os.environ.get("SUBTITLE_API_KEY", "")
 MODEL = os.environ.get("SUBTITLE_MODEL", "glm-5.3")
 MODEL_FB = os.environ.get("SUBTITLE_MODEL_FB", "qwen3.8-max")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
+# --- 速度旋钮(都可用仓库 Variables 覆盖, 不改代码) ---
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))        # 每请求条数: 10 -> 50
+XLATE_CONC = int(os.environ.get("XLATE_CONC", "4"))        # 并发翻译请求数(网关 503 敏感, 别超 6)
+WHISPER_THREADS = int(os.environ.get("WHISPER_THREADS", "4"))
+WHISPER_BATCH = int(os.environ.get("WHISPER_BATCH", "8"))  # 批量推理批大小(BatchedInferencePipeline)
+WHISPER_BEAM = int(os.environ.get("WHISPER_BEAM", "1"))    # 1=贪心, 最快
+BURN_PRESET = os.environ.get("BURN_PRESET", "ultrafast")   # veryfast -> ultrafast
+BURN_CRF = os.environ.get("BURN_CRF", "23")
+BURN_MODE = os.environ.get("BURN_MODE", "hard")            # hard=烧进画面 / soft=软字幕(近乎免转码)
 
 # 分片命名: [已处理_]<base>.partNNN[_D].mp4  ；<base> 可能含中文/番号/空格
 _RE_PART = re.compile(r"(?:^|_)(?P<base>.+?)\.part(?P<idx>\d+)(?:_[A-Za-z])?\.(?P<ext>mp4|mkv|avi|wmv|mov|flv|m4v|rmvb|ts|mpg|mpeg|webm|3gp)$", re.I)
@@ -135,14 +146,26 @@ def group_sizes(files, groups):
 
 
 def download_group(remote, path, base, parts, workdir):
-    """下载一组分片到 workdir, 返回按序的本地路径列表"""
+    """下载一组分片到 workdir, 返回按序的本地路径列表。
+
+    速度: 一次 rclone copy --files-from(并行 transfers), 不再逐片起进程。
+    """
+    lst = os.path.join(workdir, "dl.txt")
+    with io.open(lst, "w", encoding="utf-8") as f:
+        for _idx, fn in parts:
+            f.write(fn + "\n")
+    rc, out, err = run(["rclone", "copy", "%s:%s" % (remote, path), workdir,
+                        "--files-from", lst, "--transfers", "8", "--checkers", "8",
+                        "--drive-chunk-size", "128M", "--multi-thread-streams", "4",
+                        "--retries", "3", "--stats-one-line", "--stats", "30s"])
+    if rc != 0:
+        raise RuntimeError("下载失败: %s" % err[-200:])
     locals_ = []
     for idx, fn in parts:
-        dst = os.path.join(workdir, "p%04d_%s" % (idx, re.sub(r"[^\w.\-]", "_", os.path.basename(fn))[-60:]))
-        rc, out, err = run(["rclone", "copyto", "%s:%s/%s" % (remote, path, fn), dst, "--retries", "3"])
-        if rc != 0:
-            raise RuntimeError("下载失败 %s: %s" % (fn[:20], err[:200]))
-        locals_.append(dst)
+        local = os.path.join(workdir, os.path.basename(fn))
+        if not os.path.exists(local):
+            raise RuntimeError("下载后缺文件 idx=%d" % idx)
+        locals_.append(local)
     return locals_
 
 
@@ -181,27 +204,26 @@ def concat_parts(local_parts, outpath):
 
 # ---------------- ASR ----------------
 def transcribe(video_path, whisper_model, max_seconds=0):
-    """faster-whisper 日文转写, 返回 [(start, end, text), ...]"""
-    from faster_whisper import WhisperModel
-    log("加载 whisper 模型 %s (CPU int8)..." % whisper_model)
-    model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+    """faster-whisper 日文转写, 返回 [(start, end, text), ...]
 
-    def _run(use_vad):
-        log("开始转写(日文, vad=%s, max_s=%s)..." % (use_vad, max_seconds or "full"))
-        kw = dict(language="ja", beam_size=5, condition_on_previous_text=False)
-        if max_seconds:
-            kw["clip_timestamps"] = "0,%d" % max_seconds
-        if use_vad:
-            kw["vad_filter"] = True
-            # 放宽 VAD: 这类片对白稀疏, 阈值过高会把对白整段滤掉(实测 long-audio 出 0 条)
-            kw["vad_parameters"] = {"min_silence_duration_ms": 2000, "threshold": 0.15,
-                                    "min_speech_duration_ms": 50, "speech_pad_ms": 400}
-        else:
-            kw["vad_filter"] = False
-        segments, info = model.transcribe(video_path, **kw)
-        log("检测语种=%s p=%.2f, 时长=%.1fs" % (info.language, info.language_probability, info.duration))
-        out = []
-        lastlog = time.time()
+    速度: CPU int8 + 批量推理(BatchedInferencePipeline) + 贪心解码(beam=1)。
+    VAD 空结果时先"放宽 VAD"重跑, 最后才全量无 VAD —— 不再一上来就跑两遍全片。
+    """
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
+    log("加载 whisper 模型 %s (CPU int8, threads=%d)..." % (whisper_model, WHISPER_THREADS))
+    model = WhisperModel(whisper_model, device="cpu", compute_type="int8",
+                         cpu_threads=WHISPER_THREADS, num_workers=1)
+    pipe = BatchedInferencePipeline(model=model)
+
+    # 紧 VAD: 这类片对白稀疏, 但阈值过高会把对白整段滤掉(旧版实测 long-audio 出 0 条)
+    VAD_TIGHT = {"min_silence_duration_ms": 2000, "threshold": 0.15,
+                 "min_speech_duration_ms": 50, "speech_pad_ms": 400}
+    # 放宽 VAD: 出 0 条时的第一手段(比无 VAD 全量重跑快好几倍)
+    VAD_LOOSE = {"min_silence_duration_ms": 400, "threshold": 0.04,
+                 "min_speech_duration_ms": 30, "speech_pad_ms": 500}
+
+    def _collect(segments, info):
+        out, lastlog = [], time.time()
         for seg in segments:
             txt = (seg.text or "").strip()
             if txt:
@@ -212,9 +234,30 @@ def transcribe(video_path, whisper_model, max_seconds=0):
                 lastlog = time.time()
         return out
 
-    out = _run(True)
+    def _run(use_vad, vad_params=None):
+        log("开始转写(日文, vad=%s, beam=%d, batch=%d, max_s=%s)..." % (
+            use_vad, WHISPER_BEAM, WHISPER_BATCH, max_seconds or "full"))
+        kw = dict(language="ja", beam_size=WHISPER_BEAM, condition_on_previous_text=False,
+                  vad_filter=use_vad)
+        if use_vad and vad_params:
+            kw["vad_parameters"] = vad_params
+        if max_seconds or not use_vad:
+            # 探针(需 clip_timestamps 字符串)或全量无 VAD:
+            # 批量管线在 vad_filter=False 且无 clip_timestamps 时直接 RuntimeError, 所以走单条路径
+            if max_seconds:
+                kw["clip_timestamps"] = "0,%d" % max_seconds
+            segments, info = model.transcribe(video_path, **kw)
+        else:
+            segments, info = pipe.transcribe(video_path, batch_size=WHISPER_BATCH, **kw)
+        log("检测语种=%s p=%.2f, 时长=%.1fs" % (info.language, info.language_probability, info.duration))
+        return _collect(segments, info)
+
+    out = _run(True, VAD_TIGHT)
     if not out and not max_seconds:
-        log("!! VAD 后无字幕, 回退到无 VAD 重转写")
+        log("!! 紧 VAD 后无字幕, 先用放宽 VAD 重跑(比全量重跑快得多)")
+        out = _run(True, VAD_LOOSE)
+    if not out and not max_seconds:
+        log("!! 放宽 VAD 仍无字幕, 回退到无 VAD 全量转写")
         out = _run(False)
     log("转写完成: %d 条字幕" % len(out))
     return out
@@ -223,10 +266,11 @@ def transcribe(video_path, whisper_model, max_seconds=0):
 # ---------------- 翻译 ----------------
 def _post_chat(model, messages, timeout=120):
     body = json.dumps({"model": model, "messages": messages,
-                       "temperature": 0.2, "max_tokens": 4000, "stream": False}).encode()
+                       "temperature": 0.2, "max_tokens": 8000, "stream": False}).encode()
     req = urllib.request.Request(API_BASE + "/chat/completions", data=body,
                                  headers={"Authorization": "Bearer " + API_KEY,
-                                          "Content-Type": "application/json"})
+                                          "Content-Type": "application/json",
+                                          "Connection": "keep-alive"})
     r = urllib.request.urlopen(req, timeout=timeout)
     d = json.loads(r.read())
     return d["choices"][0]["message"]["content"]
@@ -259,47 +303,74 @@ def _extract_json_array(text):
         return None
 
 
-def _translate_batch(payload):
-    """翻译一批 [{i,t}], 返回 {i: zh}; 多模型+多重试, 全失败返回 None"""
+_FAST_MODELS = [MODEL, MODEL_FB]
+_RESCUE_MODELS = [MODEL, MODEL_FB, "qwen3.7-max", "qwen3.8-max", "deepseek-v4-pro"]
+# 网关并发闸门: 高并发会大量 503/504, 所以同时最多 XLATE_CONC 个请求在飞
+_XLATE_SEM = threading.Semaphore(max(1, XLATE_CONC))
+
+
+def _translate_batch(payload, models=None, attempts=2):
+    """翻译一批 [{i,t}], 返回 {i: zh}; 失败返回 None。
+
+    速度: 阶梯收窄(2 模型 × 2 次), 退避带抖动; 旧的 5 模型 × 4 次 × sleep 会拖到分钟级。
+    """
     user = json.dumps(payload, ensure_ascii=False)
-    models = [MODEL, MODEL_FB, "qwen3.7-max", "qwen3.8-max", "deepseek-v4-pro"]
-    for model in models:
-        for attempt in range(4):
+    for model in (models or _FAST_MODELS):
+        for attempt in range(attempts):
             try:
-                txt = _post_chat(model, [
-                    {"role": "system", "content": _SYS},
-                    {"role": "user", "content": user},
-                ], timeout=90)
+                with _XLATE_SEM:
+                    txt = _post_chat(model, [
+                        {"role": "system", "content": _SYS},
+                        {"role": "user", "content": user},
+                    ], timeout=180)
                 arr = _extract_json_array(txt)
                 if isinstance(arr, list) and len(arr) >= 1:
                     got = {int(x["i"]): str(x["z"]).strip() for x in arr if "i" in x and "z" in x}
                     if got:
                         return got
+                log("翻译批(len=%d) 用 %s 返回不可解析(第%d次)" % (len(payload), model, attempt + 1))
             except Exception as e:
                 log("翻译批(len=%d) 用 %s 失败(第%d次): %s" % (len(payload), model, attempt + 1, str(e)[:100]))
-                time.sleep(2 + attempt * 3)
-    return None
+            time.sleep(min(15.0, (2 ** attempt) + random.uniform(0, 1.5)))
 
 
-def _translate_items(items):
+def _translate_items(items, models=None, attempts=2):
     """items: [(全局i, text)]; 成功返回 {i: zh}。失败则二分拆分重试, 最差保证单条重试。"""
-    got = _translate_batch([{"i": gi, "t": tx} for gi, tx in items])
+    got = _translate_batch([{"i": gi, "t": tx} for gi, tx in items], models, attempts)
     if got:
         return got
     if len(items) == 1:
-        # 单条仍失败: 再单独狠狠重试几轮
+        # 单条仍失败: 换全模型阶梯狠狠重试几轮
         gi, tx = items[0]
-        for _ in range(3):
-            g2 = _translate_batch([{"i": gi, "t": tx}])
+        for _ in range(2):
+            g2 = _translate_batch([{"i": gi, "t": tx}], _RESCUE_MODELS, attempts=2)
             if g2:
                 return g2
-            time.sleep(5)
         log("!! 单条 i=%d 多次重试仍失败" % gi)
         return {}
     mid = len(items) // 2
     out = {}
-    out.update(_translate_items(items[:mid]))
-    out.update(_translate_items(items[mid:]))
+    out.update(_translate_items(items[:mid], models, attempts))
+    out.update(_translate_items(items[mid:], models, attempts))
+    return out
+
+
+def _translate_all(items, models=None, attempts=2):
+    """把 [(全局i,text)] 并行分批翻译, 返回 {i: zh}。"""
+    if not items:
+        return {}
+    chunks = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    out = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(XLATE_CONC, len(chunks)))) as ex:
+        futs = [ex.submit(_translate_items, c, models, attempts) for c in chunks]
+        for fu in as_completed(futs):
+            try:
+                out.update(fu.result() or {})
+            except Exception as e:
+                log("!! 翻译分批任务异常: %s" % str(e)[:120])
+            done += 1
+            log("翻译进度 批 %d/%d, 已得 %d 条" % (done, len(chunks), len(out)))
     return out
 
 
@@ -331,7 +402,7 @@ def _retranslate_bad(result, rounds=3):
         if not bad:
             return result
         log("第%d轮补译: %d 条坏译文(日文/泄漏/空)" % (rd + 1, len(bad)))
-        got = _translate_items(bad)
+        got = _translate_all(bad, _RESCUE_MODELS, attempts=2)
         for i, _ in bad:
             zh = got.get(i)
             if zh and not _is_bad_translation(zh):
@@ -343,20 +414,19 @@ def _retranslate_bad(result, rounds=3):
 
 
 def translate_segments(segs):
-    """segs: [(start,end,text)] -> [(start,end,zh)]；分批 + 失败二分重试 + 日文残留补译"""
-    result = [None] * len(segs)
+    """segs: [(start,end,text)] -> [(start,end,zh)]；并发分批 + 失败二分重试 + 日文残留补译"""
     total = len(segs)
-    for bs in range(0, total, BATCH_SIZE):
-        batch = segs[bs:bs + BATCH_SIZE]
-        items = [(bs + j, b[2]) for j, b in enumerate(batch)]
-        got = _translate_items(items)
-        for j, b in enumerate(batch):
-            gi = bs + j
-            zh = got.get(gi)
-            if not zh:
-                zh = b[2]  # 极端兜底: 只有单条也彻底失败才会到这里
-            result[gi] = (b[0], b[1], zh)
-        log("翻译进度 %d/%d" % (min(bs + BATCH_SIZE, total), total))
+    items = [(i, s[2]) for i, s in enumerate(segs)]
+    got = _translate_all(items)
+    miss = 0
+    result = [None] * total
+    for i, s in enumerate(segs):
+        zh = got.get(i)
+        if not zh:
+            zh = s[2]   # 极端兜底: 只有彻底失败才会到这里, 之后由补译轮再救
+            miss += 1
+        result[i] = (s[0], s[1], zh)
+    log("翻译完成 %d/%d 条(缺 %d)" % (total - miss, total, miss))
     # 收尾: 补译所有坏译文(日文残留/泄漏思考/空)
     result = _retranslate_bad(result)
     return result
@@ -427,24 +497,37 @@ def _ff_escape_path(p):
 
 
 def burn_subtitles(video_path, srt_local, base, remote, path, gdir):
-    """把 srt 硬烧进整片, 输出 <番号>_字幕版.mp4, 上传到 <源目录>/字幕版/"""
+    """把 srt 硬烧进整片, 输出 <番号>_字幕版.mp4, 上传到 <源目录>/字幕版/
+
+    BURN_MODE=hard(默认): libx264 -preset ultrafast -crf 23(比 veryfast 快约 2-3 倍)
+    BURN_MODE=soft      : 视频流直接 copy, 字幕作为软字幕塞进 mp4(近乎免转码, 秒级)
+    """
     out_mp4 = os.path.join(gdir, "burned.mp4")
     vf = "subtitles='%s':force_style='FontName=Noto Sans CJK SC,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1,Shadow=0,MarginV=18'" % _ff_escape_path(srt_local)
-    log("开始烧制硬字幕(CPU 编码, 较慢)...")
-    # 先试 -c:v copy 不行(烧字幕必须重编码), 直接 libx264 + 高质量
-    rc, out, err = run(["ffmpeg", "-y", "-i", video_path, "-vf", vf,
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                        "-c:a", "copy", out_mp4])
+    if BURN_MODE == "soft":
+        log("装软字幕(视频流 copy, 不重编码)...")
+        rc, out, err = run(["ffmpeg", "-y", "-i", video_path, "-i", srt_local,
+                            "-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
+                            "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                            "-metadata:s:s:0", "language=chi", out_mp4])
+    else:
+        log("开始烧制硬字幕(CPU 编码 preset=%s crf=%s)..." % (BURN_PRESET, BURN_CRF))
+        # 先试 -c:v copy 不行(烧字幕必须重编码), 直接 libx264 + 快速档
+        rc, out, err = run(["ffmpeg", "-y", "-i", video_path, "-vf", vf,
+                            "-c:v", "libx264", "-preset", BURN_PRESET, "-crf", BURN_CRF,
+                            "-x264-params", "rc-lookahead=0:sync-lookahead=0:bframes=0:ref=1:me=dia:subme=0:trellis=0:mbtree=0",
+                            "-threads", "0", "-c:a", "copy", out_mp4])
     if rc != 0 or not os.path.exists(out_mp4):
-        log("!! 硬字幕烧制失败: %s" % (err[-250:] if err else ""))
+        log("!! 字幕封装/烧制失败: %s" % (err[-250:] if err else ""))
         return False
-    log("烧制完成 -> %.1f MB" % (os.path.getsize(out_mp4) / 1048576.0))
+    log("输出完成 -> %.1f MB" % (os.path.getsize(out_mp4) / 1048576.0))
     burn_name = "%s_字幕版.mp4" % base
     dst = "%s:%s/%s/%s" % (remote, path, BURN_DIR, burn_name)
-    rc2, o2, e2 = run(["rclone", "copyto", out_mp4, dst, "--retries", "3"])
-    log("上传硬字幕视频 -> rc=%d" % rc2)
+    rc2, o2, e2 = run(["rclone", "copyto", out_mp4, dst, "--retries", "3",
+                       "--drive-chunk-size", "128M", "--multi-thread-streams", "4"])
+    log("上传字幕版视频 -> rc=%d" % rc2)
     if rc2 != 0:
-        log("!! 上传硬字幕视频失败: %s" % (e2[:200] if e2 else ""))
+        log("!! 上传字幕版视频失败: %s" % (e2[:200] if e2 else ""))
     try:
         os.remove(out_mp4)
     except Exception:
