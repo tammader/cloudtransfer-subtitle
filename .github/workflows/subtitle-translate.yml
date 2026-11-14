@@ -6,7 +6,8 @@ name: subtitle-translate
 #
 # 公开仓库: 日志全部脱敏(logmask), 真实盘名/目录名/番号/链接均不出现明文。
 # Secrets: RCLONE_CONF(含源远端) / PATHS_JSON(SUB_SRC/SUB_DIR/_WORDS) /
-#          SUBTITLE_API_BASE / SUBTITLE_API_KEY / SUBTITLE_MODEL / SUBTITLE_MODEL_FB
+#          SUBTITLE_API_BASE / SUBTITLE_API_KEY / SUBTITLE_MODEL / SUBTITLE_MODEL_FB /
+#          TRANSLATE_RULES(翻译附加规则, 可选) / TRANSLATE_TERMS(术语对照 JSON 文本, 可选)
 
 on:
   # 兜底定时(每 2 小时): 主调度走 subtitle-dispatch(每 10 分钟补满并行)。
@@ -166,8 +167,10 @@ jobs:
           BURN_ONLY: ${{ inputs.burn_only || 'false' }}
           FIX_SRT: ${{ inputs.fix_srt || 'false' }}
           NO_REBURN: ${{ inputs.no_reburn || 'false' }}
-          # 翻译附加规则: 优先用手动输入, 否则用仓库变量 vars.TRANSLATE_RULES(可长期定制)
-          EXTRA_RULES: ${{ inputs.extra_rules || vars.TRANSLATE_RULES || '' }}
+          # 翻译附加规则: 优先手动输入, 否则用 Secret TRANSLATE_RULES(长期定制, 不进日志)
+          EXTRA_RULES: ${{ inputs.extra_rules || secrets.TRANSLATE_RULES || '' }}
+          # 术语对照表(JSON 文本): 走 Secret, 不落公开仓库
+          TRANSLATE_TERMS: ${{ secrets.TRANSLATE_TERMS || '' }}
         run: |
           set -e
           # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, large-v3-turbo, 硬字幕)
