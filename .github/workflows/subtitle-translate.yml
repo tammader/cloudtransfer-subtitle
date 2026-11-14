@@ -9,10 +9,10 @@ name: subtitle-translate
 #          SUBTITLE_API_BASE / SUBTITLE_API_KEY / SUBTITLE_MODEL / SUBTITLE_MODEL_FB
 
 on:
-  # 定时自动跑一批(不依赖会话在线)。每 6 小时一次, 每次处理 1 组(medium+硬字幕)。
+  # 兜底定时(每 2 小时): 主调度走 subtitle-dispatch(每 10 分钟补满并行)。
   # 已有 srt 的组自动跳过(幂等), 所以每次都取当前最前面的未处理组。
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -82,6 +82,15 @@ env:
   SUBTITLE_API_KEY: ${{ secrets.SUBTITLE_API_KEY }}
   SUBTITLE_MODEL: ${{ secrets.SUBTITLE_MODEL }}
   SUBTITLE_MODEL_FB: ${{ secrets.SUBTITLE_MODEL_FB }}
+  # 速度旋钮(仓库 Variables 可改, 不改代码即可调优)
+  BATCH_SIZE: ${{ vars.BATCH_SIZE || '50' }}          # 每请求字幕条数(旧: 10)
+  XLATE_CONC: ${{ vars.XLATE_CONC || '4' }}           # 并发翻译请求数(旧: 1, 串行)
+  WHISPER_THREADS: ${{ vars.WHISPER_THREADS || '4' }}
+  WHISPER_BATCH: ${{ vars.WHISPER_BATCH || '8' }}     # 批量推理批大小(旧: 无)
+  WHISPER_BEAM: ${{ vars.WHISPER_BEAM || '1' }}       # 旧: 5
+  BURN_PRESET: ${{ vars.BURN_PRESET || 'ultrafast' }} # 旧: veryfast
+  BURN_CRF: ${{ vars.BURN_CRF || '23' }}              # 旧: 22
+  BURN_MODE: ${{ vars.BURN_MODE || 'hard' }}          # hard=烧进画面 / soft=软字幕
 
 jobs:
   translate:
@@ -120,6 +129,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: 缓存 pip 与 whisper 模型权重
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/huggingface
+          key: sub-${{ runner.os }}-pip-hf-v1
+
       - name: 装 faster-whisper
         run: |
           python3 -m pip install --quiet --upgrade pip
@@ -149,9 +166,9 @@ jobs:
           set -e
           # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, medium, 硬字幕)
           if [ "$EVENT_NAME" = "schedule" ]; then
-            APPLY="true"; LIMIT_GROUPS="1"; WHISPER_MODEL="medium"; START_INDEX="0"
+            APPLY="true"; LIMIT_GROUPS="3"; WHISPER_MODEL="medium"; START_INDEX="0"
             BURN_VIDEO="true"; ONLY=""
-            echo "(定时触发: 处理1组 medium+硬字幕)"
+            echo "(定时触发: 处理3组 medium+硬字幕, 摊薄每轮 40s 固定开销)"
           fi
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
           export BURN_VIDEO="$BURN_VIDEO"
