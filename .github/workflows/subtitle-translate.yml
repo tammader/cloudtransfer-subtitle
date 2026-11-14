@@ -13,7 +13,9 @@ on:
   # 兜底定时(每 2 小时): 主调度走 subtitle-dispatch(每 10 分钟补满并行)。
   # 已有 srt 的组自动跳过(幂等), 所以每次都取当前最前面的未处理组。
   schedule:
-    - cron: "0 */2 * * *"
+    # 错峰: 挪到 :23 —— 账号内 gen-manifest/in-pipeline/gd6-ydy2-* 等一批 */3、*/4、*/6
+    #       定时任务都在 :00 起跑, 0 点与 12 点最挤; :23 全账号无冲突。
+    - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       apply:
