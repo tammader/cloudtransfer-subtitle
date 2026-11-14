@@ -6,8 +6,10 @@ name: subtitle-report
 
 on:
   schedule:
-    # 每 2 小时 (UTC 0 */2) = 北京 偶数点
-    - cron: "0 */2 * * *"
+    # 每 2 小时 (UTC)
+    # 错峰: 挪到 :43 —— 账号内多个 */3、*/4、*/6 定时任务都在 :00 起跑;
+    #       :43 全账号无冲突(20 并发额度为账号级共享)。
+    - cron: "43 */2 * * *"
   workflow_dispatch: {}
 
 concurrency:
