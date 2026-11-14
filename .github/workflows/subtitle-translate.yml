@@ -1,7 +1,7 @@
 name: subtitle-translate
 
 # 日文语音视频 → 中文 SRT 字幕(纯云端)
-#   分片按「番号」归组 → ffmpeg 拼整片 → faster-whisper(large-v3) 日文转写
+#   分片按「番号」归组 → ffmpeg 拼整片 → faster-whisper(large-v3-turbo) 日文转写
 #   → OpenAI 兼容网关批量翻译(简体中文, 保时间轴) → 同名 .srt 上传回源目录
 #
 # 公开仓库: 日志全部脱敏(logmask), 真实盘名/目录名/番号/链接均不出现明文。
@@ -32,9 +32,9 @@ on:
         required: false
         default: "300"
       whisper_model:
-        description: "whisper 模型(medium / large-v3 / small); 默认 medium 更快"
+        description: "whisper 模型(large-v3-turbo / turbo / large-v3 / medium / small); 默认 large-v3-turbo"
         required: false
-        default: "medium"
+        default: "large-v3-turbo"
       probe_only:
         description: "验证用: 只转写前 N 秒(如 120), 不上传; 0=正常全量"
         required: false
@@ -67,6 +67,10 @@ on:
         description: "配合 fix_srt: 只修 srt 不重烧视频"
         required: false
         default: "false"
+      extra_rules:
+        description: "翻译附加规则(自然语言, 可多行): 如术语对照/人名保留/语气要求; 留空=用默认规则"
+        required: false
+        default: ""
 
 concurrency:
   # 按 batch_tag 唯一, 允许多批并行跑不同组(不会互相取消); cancel-in-progress 仍关
@@ -154,7 +158,7 @@ jobs:
           ONLY: ${{ inputs.only || '' }}
           LIMIT_GROUPS: ${{ inputs.limit_groups || '1' }}
           BUDGET_MIN: ${{ inputs.budget_min || '300' }}
-          WHISPER_MODEL: ${{ inputs.whisper_model || 'medium' }}
+          WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3-turbo' }}
           PROBE_ONLY: ${{ inputs.probe_only || '0' }}
           START_INDEX: ${{ inputs.start_index || '0' }}
           BURN_VIDEO: ${{ inputs.burn_video || 'true' }}
@@ -162,13 +166,15 @@ jobs:
           BURN_ONLY: ${{ inputs.burn_only || 'false' }}
           FIX_SRT: ${{ inputs.fix_srt || 'false' }}
           NO_REBURN: ${{ inputs.no_reburn || 'false' }}
+          # 翻译附加规则: 优先用手动输入, 否则用仓库变量 vars.TRANSLATE_RULES(可长期定制)
+          EXTRA_RULES: ${{ inputs.extra_rules || vars.TRANSLATE_RULES || '' }}
         run: |
           set -e
-          # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, medium, 硬字幕)
+          # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, large-v3-turbo, 硬字幕)
           if [ "$EVENT_NAME" = "schedule" ]; then
-            APPLY="true"; LIMIT_GROUPS="3"; WHISPER_MODEL="medium"; START_INDEX="0"
+            APPLY="true"; LIMIT_GROUPS="3"; WHISPER_MODEL="large-v3-turbo"; START_INDEX="0"
             BURN_VIDEO="true"; ONLY=""
-            echo "(定时触发: 处理3组 medium+硬字幕, 摊薄每轮 40s 固定开销)"
+            echo "(定时触发: 处理3组 large-v3-turbo+硬字幕, 摊薄每轮 40s 固定开销)"
           fi
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
           export BURN_VIDEO="$BURN_VIDEO"
