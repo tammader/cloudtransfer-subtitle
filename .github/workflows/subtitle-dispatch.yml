@@ -1,8 +1,9 @@
 name: subtitle-dispatch
 
-# 字幕批量自动调度器(每 10 分钟): 把 subtitle-translate 并行批次补满到 6 路, 每路 3 组。
-#   - 待处理=0 且近期无活动 -> 发一条"全部完成"到 TG
-#   - 活跃 < 6 -> 自动 dispatch 差值个批次(medium+硬字幕, 幂等跳过已有 srt)
+# 字幕批量自动调度器(每 10 分钟): 翻译阶段 —— 只出 srt, 不烧录。
+#   把 subtitle-translate 并行批次(默认 6 路, 每路 3 组)补满, burn_video=false。
+#   - 待办=0 且近期无活动 -> 发一条"翻译全部完成"到 TG
+#   烧录阶段见 subtitle-burn.yml(PHASE=burn), 前置: 翻译全完成 + 质量校验通过。
 # 从此不依赖本机/会话在线 —— 全流程云上闭环。
 # Secrets: GH_TOKEN / RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
 
@@ -26,6 +27,11 @@ env:
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
   TG_TOKEN: ${{ secrets.TG_TOKEN }}
   TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  # 本调度器只负责「翻译阶段」: 只出 srt, 不烧录(burn_video=false)
+  # 烧录由 subtitle-burn.yml(PHASE=burn) 在翻译全部完成 + 质量校验通过后再跑
+  PHASE: translate
+  TARGET_PARALLEL: ${{ vars.TARGET_PARALLEL || '6' }}
+  GROUPS_PER_RUN: ${{ vars.GROUPS_PER_RUN || '3' }}
 
 jobs:
   dispatch:
