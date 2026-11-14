@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 """字幕批量自动调度器(云端, GitHub Actions 定时跑)
 
-职责: 每 30 分钟检查一次, 把 subtitle-translate 的并行批次补满到 4 路。
-  1. 统计 gdrive6:out3 的待处理组数(subtitle_progress.collect)
-     - 待处理=0 且近期无活动 -> 发一条"全部完成"到 TG(防重复: 6h 内没跑过才发)
-  2. 查 subtitle-translate 活跃 run 数; 少于 4 就补发差值个批次
-     - medium + 硬字幕 + 大小升序(脚本内部排序), start_index 0..3
-     - 幂等: 已有 srt 的组自动跳过, 重复触发不产生重复字幕
-环境: GH_TOKEN(调 API+dispatch) / RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
+两阶段(用环境变量 PHASE 切换):
+  PHASE=translate(默认) —— 只出 srt: 下载/拼接/转写/翻译/上传 srt, **不烧录**。
+  PHASE=burn            —— 只烧录: 对"已有 srt 但缺硬字幕视频"的组 拼片+烧制+上传。
+                          前置闸门: 必须"所有组都已有 srt"(翻译阶段彻底完成)才启动,
+                          这样两阶段天然串行, 不会互抢并发。
+
+职责(每 10 分钟检查一次, 把并行批次补满):
+  1. 统计源目录待办数(subtitle_progress.collect)
+     - translate 阶段看 pending(没 srt 的组)
+     - burn      阶段看 srt_no_burn(有 srt 但缺硬字幕的组)
+  2. 查 subtitle-translate 活跃 run 数; 少于 TARGET_PARALLEL 就补发差值个批次
+     - start_index 按 GROUPS_PER_RUN 递进(0,3,6...), 相邻批次不重叠
+     - 幂等: 已有 srt / 已有硬字幕的组自动跳过
+  Secrets: GH_TOKEN / RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
 """
 import json
 import os
@@ -26,8 +33,9 @@ logmask.install()
 API = "https://api.github.com"
 REPO = "tammader/cloudtransfer-subtitle"
 WF = "subtitle-translate.yml"
-TARGET_PARALLEL = 6          # 并发批次(旧 4; GH 免费额度允许 20, 6 是网关 503 与网盘限速的折中)
-GROUPS_PER_RUN = 3           # 每批次处理几组(摊薄每轮 ~40s 固定开销)
+TARGET_PARALLEL = int(os.environ.get("TARGET_PARALLEL", "6"))   # 并发批次(仓库 Variables 可调)
+GROUPS_PER_RUN = int(os.environ.get("GROUPS_PER_RUN", "3"))     # 每批次处理几组
+PHASE = (os.environ.get("PHASE") or "translate").strip().lower()  # translate | burn
 
 
 def log(m):
@@ -56,15 +64,24 @@ def main():
     if not src:
         log("!! 缺 SUB_SRC(PATHS_JSON)")
         return 1
+    log("阶段 = %s" % PHASE)
 
-    # 1) 待处理统计
+    # 1) 统计
     try:
         stats = sp.collect()
-        log("总组=%d 已出字幕=%d 硬字幕=%d 待处理=%d" % (
-            stats["total_groups"], stats["srt"], stats["burn"], stats["pending"]))
+        log("总组=%d 已出字幕=%d 硬字幕=%d 无字幕=%d 待补烧=%d" % (
+            stats["total_groups"], stats["srt"], stats["burn"],
+            stats["pending"], stats["srt_no_burn"]))
     except Exception as e:
         log("!! 统计失败: %s" % str(e)[:200])
         return 1
+
+    # 烧录阶段的前置闸门: 翻译必须全部完成, 否则两阶段会互相抢并发
+    if PHASE == "burn" and stats["pending"] > 0:
+        log("翻译阶段未完成(仍有 %d 组无 srt), 烧录阶段暂不启动" % stats["pending"])
+        return 0
+
+    todo = stats["srt_no_burn"] if PHASE == "burn" else stats["pending"]
 
     # 2) 活跃 run 数
     st, d = gh_req("GET", "/repos/%s/actions/workflows/%s/runs?per_page=30" % (REPO, WF), tok)
@@ -72,15 +89,19 @@ def main():
     act = [r for r in runs if r["status"] in ("queued", "in_progress")]
     log("活跃批次: %d" % len(act))
 
-    # 3) 全部完成时: 只在"近期确实跑过"的情况下发一条完成通知(防刷屏)
-    if stats["pending"] == 0 and not act:
+    # 3) 本阶段无待办且无活跃: 发一条完成通知(6h 内只发一次, 防刷屏)
+    if todo == 0 and not act:
         recent = [r for r in runs if r["status"] == "completed"][:1]
         if recent:
             try:
                 created = time.mktime(time.strptime(recent[0]["created_at"], "%Y-%m-%dT%H:%M:%SZ"))
                 if time.time() - created < 6 * 3600:
-                    sp.tg_send("🎉 字幕批量全部完成!\n总组 %d | 字幕 %d | 硬字幕 %d" % (
-                        stats["total_groups"], stats["srt"], stats["burn"]))
+                    if PHASE == "burn":
+                        sp.tg_send("🎬 硬字幕烧录全部完成!\n总组 %d | 字幕 %d | 硬字幕 %d" % (
+                            stats["total_groups"], stats["srt"], stats["burn"]))
+                    else:
+                        sp.tg_send("📝 字幕翻译全部完成(待烧录 %d 组)!\n总组 %d | 字幕 %d | 硬字幕 %d" % (
+                            stats["srt_no_burn"], stats["total_groups"], stats["srt"], stats["burn"]))
                     log("已发完成通知")
             except Exception:
                 pass
@@ -93,17 +114,23 @@ def main():
         return 0
     bt = int(time.time())
     n_ok = 0
+    base = len(act)                      # 排在已在跑的批次之后, 避免区间重叠
     for i in range(need):
+        si = (base + i) * GROUPS_PER_RUN    # 0,3,6,9... 不重叠(旧写法 i%N 会让相邻批次重叠 2 组)
         inputs = {"apply": "true", "limit_groups": str(GROUPS_PER_RUN), "budget_min": "340",
-                  "whisper_model": "large-v3-turbo", "start_index": str(i % TARGET_PARALLEL),
-                  "batch_tag": "auto_%d_%d" % (bt, i), "burn_video": "true"}
+                  "whisper_model": "large-v3-turbo", "start_index": str(si),
+                  "batch_tag": "%s_%d_%d" % (PHASE, bt, i),
+                  # 翻译阶段只出 srt; 烧录阶段只烧已有 srt
+                  "burn_video": "true" if PHASE == "burn" else "false"}
+        if PHASE == "burn":
+            inputs["burn_only"] = "true"
         st, dd = gh_req("POST", "/repos/%s/actions/workflows/%s/dispatches" % (REPO, WF), tok,
                         {"ref": "main", "inputs": inputs})
         if st in (204, 200, 201):
             n_ok += 1
-            log("补发批次 si=%d 组数=%d OK" % (i % TARGET_PARALLEL, GROUPS_PER_RUN))
+            log("补发批次 si=%d 组数=%d OK" % (si, GROUPS_PER_RUN))
         else:
-            log("补发失败 si=%d: %s %s" % (i, st, dd.get("_err", ""))[:180])
+            log("补发失败 si=%d: %s %s" % (si, st, dd.get("_err", ""))[:180])
         time.sleep(2)
     log("本轮补发 %d/%d" % (n_ok, need))
     return 0
