@@ -1,15 +1,15 @@
 name: subtitle-dispatch
 
-# 字幕批量自动调度器(每 30 分钟): 把 subtitle-translate 并行批次补满到 4 路。
+# 字幕批量自动调度器(每 10 分钟): 把 subtitle-translate 并行批次补满到 6 路, 每路 3 组。
 #   - 待处理=0 且近期无活动 -> 发一条"全部完成"到 TG
-#   - 活跃 < 4 -> 自动 dispatch 差值个批次(medium+硬字幕, 幂等跳过已有 srt)
+#   - 活跃 < 6 -> 自动 dispatch 差值个批次(medium+硬字幕, 幂等跳过已有 srt)
 # 从此不依赖本机/会话在线 —— 全流程云上闭环。
 # Secrets: GH_TOKEN / RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
 
 on:
   schedule:
-    # 每 30 分钟
-    - cron: "*/30 * * * *"
+    # 每 10 分钟补一次(旧 30 分钟窗口太大: 单批 5-20 分钟就跑完, 大半时间空转)
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 concurrency:
