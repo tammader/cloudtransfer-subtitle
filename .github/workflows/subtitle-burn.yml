@@ -1,0 +1,75 @@
+name: subtitle-burn
+
+# 烧录阶段(第三段): 先过质量闸门, 通过后才派发 burn_only 批次。
+#   - 只处理「已有 srt 但缺 <番号>_字幕版.mp4」的组: 拼片 + 烧制硬字幕 + 上传
+#   - 不重跑转写/翻译
+#   - 双重前置: ①翻译阶段必须彻底完成(所有组都有 srt, 由 subtitle_dispatch.py 把关)
+#              ②verify_srt.py 闸门必须通过(默认允许 <=2% 的 srt 文件有问题)
+# 想跳过闸门(慎用): 手动 trigger 时把 skip_verify 设 true。
+# Secrets: GH_TOKEN / RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
+
+on:
+  schedule:
+    # 每 15 分钟补一次(错峰分钟点, 与账号内其它定时任务错开)
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      skip_verify:
+        description: "true=跳过质量校验直接烧录(慎用)"
+        required: false
+        default: "false"
+      max_bad_file_ratio:
+        description: "闸门: 允许的'有问题 srt'占比"
+        required: false
+        default: "0.02"
+
+concurrency:
+  group: subtitle-burn
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  PHASE: burn
+  TARGET_PARALLEL: ${{ vars.BURN_PARALLEL || '6' }}
+  GROUPS_PER_RUN: ${{ vars.GROUPS_PER_RUN || '3' }}
+
+jobs:
+  burn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: 质量闸门(不通过就不烧录)
+        if: always()
+        run: |
+          if [ "${{ inputs.skip_verify }}" = "true" ]; then
+            echo "(手动跳过质量闸门)"
+            exit 0
+          fi
+          python3 verify_srt.py --gate \
+            --max-bad-file-ratio "${{ inputs.max_bad_file_ratio || '0.02' }}"
+
+      - name: 派发烧录批次(PHASE=burn)
+        run: python3 subtitle_dispatch.py
