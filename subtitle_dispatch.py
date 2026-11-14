@@ -95,7 +95,7 @@ def main():
     n_ok = 0
     for i in range(need):
         inputs = {"apply": "true", "limit_groups": str(GROUPS_PER_RUN), "budget_min": "340",
-                  "whisper_model": "medium", "start_index": str(i % TARGET_PARALLEL),
+                  "whisper_model": "large-v3-turbo", "start_index": str(i % TARGET_PARALLEL),
                   "batch_tag": "auto_%d_%d" % (bt, i), "burn_video": "true"}
         st, dd = gh_req("POST", "/repos/%s/actions/workflows/%s/dispatches" % (REPO, WF), tok,
                         {"ref": "main", "inputs": inputs})
