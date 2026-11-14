@@ -26,7 +26,8 @@ logmask.install()
 API = "https://api.github.com"
 REPO = "tammader/cloudtransfer-subtitle"
 WF = "subtitle-translate.yml"
-TARGET_PARALLEL = 4
+TARGET_PARALLEL = 6          # 并发批次(旧 4; GH 免费额度允许 20, 6 是网关 503 与网盘限速的折中)
+GROUPS_PER_RUN = 3           # 每批次处理几组(摊薄每轮 ~40s 固定开销)
 
 
 def log(m):
@@ -93,14 +94,14 @@ def main():
     bt = int(time.time())
     n_ok = 0
     for i in range(need):
-        inputs = {"apply": "true", "limit_groups": "1", "budget_min": "340",
+        inputs = {"apply": "true", "limit_groups": str(GROUPS_PER_RUN), "budget_min": "340",
                   "whisper_model": "medium", "start_index": str(i % TARGET_PARALLEL),
                   "batch_tag": "auto_%d_%d" % (bt, i), "burn_video": "true"}
         st, dd = gh_req("POST", "/repos/%s/actions/workflows/%s/dispatches" % (REPO, WF), tok,
                         {"ref": "main", "inputs": inputs})
         if st in (204, 200, 201):
             n_ok += 1
-            log("补发批次 si=%d OK" % (i % TARGET_PARALLEL))
+            log("补发批次 si=%d 组数=%d OK" % (i % TARGET_PARALLEL, GROUPS_PER_RUN))
         else:
             log("补发失败 si=%d: %s %s" % (i, st, dd.get("_err", ""))[:180])
         time.sleep(2)
