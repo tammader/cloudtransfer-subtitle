@@ -50,6 +50,10 @@ on:
         description: "从待处理列表第 K 个开始(并行分批); 配合 limit_groups 划分区间"
         required: false
         default: "0"
+      sub_dir:
+        description: "源子目录(如 out4); 留空=用 PATHS_JSON 里的 SUB_DIR / SUB_DIRS"
+        required: false
+        default: ""
       burn_video:
         description: "true=额外烧制硬字幕 mp4(上传到 字幕版/ 子目录); false=只出 srt"
         required: false
@@ -164,6 +168,8 @@ jobs:
           WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3-turbo' }}
           PROBE_ONLY: ${{ inputs.probe_only || '0' }}
           START_INDEX: ${{ inputs.start_index || '0' }}
+          # 源子目录(调度器按目录轮转派发); 留空则回落到 PATHS_JSON 的 SUB_DIR
+          SUB_DIR: ${{ inputs.sub_dir || '' }}
           BURN_VIDEO: ${{ inputs.burn_video || 'true' }}
           FORCE: ${{ inputs.force || 'false' }}
           BURN_ONLY: ${{ inputs.burn_only || 'false' }}
@@ -178,8 +184,8 @@ jobs:
           # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, large-v3-turbo, 硬字幕)
           if [ "$EVENT_NAME" = "schedule" ]; then
             APPLY="true"; LIMIT_GROUPS="3"; WHISPER_MODEL="large-v3-turbo"; START_INDEX="0"
-            BURN_VIDEO="true"; ONLY=""
-            echo "(定时触发: 处理3组 large-v3-turbo+硬字幕, 摊薄每轮 40s 固定开销)"
+            BURN_VIDEO="false"; ONLY=""
+            echo "(定时触发: 只出 srt 不烧录, 处理 3 组 large-v3-turbo)"
           fi
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
           export BURN_VIDEO="$BURN_VIDEO"
