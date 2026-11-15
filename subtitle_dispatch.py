@@ -116,6 +116,11 @@ def main():
         log("!! 缺 SUB_SRC(PATHS_JSON)")
         return 1
     log("阶段 = %s" % PHASE)
+    # 阶段 3(烧硬字幕) 默认锁死: 只出 srt 时, 就算 burn workflow 被误开/误触发也不会真烧
+    if PHASE == "burn" and (os.environ.get("BURN_ENABLED") or "").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        log("烧录开关未开(BURN_ENABLED!=1): 只出 srt 模式, 本轮不派发烧录批次")
+        return 0
 
     # 1) 统计
     try:
