@@ -36,6 +36,8 @@ env:
   TG_TOKEN: ${{ secrets.TG_TOKEN }}
   TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
   PHASE: burn
+  # 阶段 3 总开关: 默认 false —— 本仓库当前只出 srt, 不开烧录
+  BURN_ENABLED: ${{ vars.BURN_ENABLED || 'false' }}
   TARGET_PARALLEL: ${{ vars.BURN_PARALLEL || '6' }}
   GROUPS_PER_RUN: ${{ vars.GROUPS_PER_RUN || '3' }}
 
