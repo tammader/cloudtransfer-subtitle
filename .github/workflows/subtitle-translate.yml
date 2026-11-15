@@ -55,9 +55,9 @@ on:
         required: false
         default: ""
       burn_video:
-        description: "true=额外烧制硬字幕 mp4(上传到 字幕版/ 子目录); false=只出 srt"
+        description: "默认 false=只出 srt(本流程不烧录); 要烧录请显式填 true 或走 subtitle-burn"
         required: false
-        default: "true"
+        default: "false"
       force:
         description: "配合 only: 即使已有 srt 也强制重跑(测试用, 慎用)"
         required: false
@@ -170,7 +170,7 @@ jobs:
           START_INDEX: ${{ inputs.start_index || '0' }}
           # 源子目录(调度器按目录轮转派发); 留空则回落到 PATHS_JSON 的 SUB_DIR
           SUB_DIR: ${{ inputs.sub_dir || '' }}
-          BURN_VIDEO: ${{ inputs.burn_video || 'true' }}
+          BURN_VIDEO: ${{ inputs.burn_video || 'false' }}
           FORCE: ${{ inputs.force || 'false' }}
           BURN_ONLY: ${{ inputs.burn_only || 'false' }}
           FIX_SRT: ${{ inputs.fix_srt || 'false' }}
@@ -184,7 +184,7 @@ jobs:
           # 定时触发(schedule)没有 inputs: 强制真跑一批(1组, large-v3-turbo, 硬字幕)
           if [ "$EVENT_NAME" = "schedule" ]; then
             APPLY="true"; LIMIT_GROUPS="3"; WHISPER_MODEL="large-v3-turbo"; START_INDEX="0"
-            BURN_VIDEO="false"; ONLY=""
+            BURN_VIDEO="false"; ONLY=""   # 定时分支: 只出 srt, 永不烧录
             echo "(定时触发: 只出 srt 不烧录, 处理 3 组 large-v3-turbo)"
           fi
           # BURN_VIDEO=true -> 脚本内 BURN_VIDEO 环境变量生效烧制硬字幕
