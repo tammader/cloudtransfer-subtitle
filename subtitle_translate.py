@@ -582,7 +582,8 @@ def parse_srt(path):
 
 
 # ---------------- 硬字幕烧制 ----------------
-BURN_VIDEO = os.environ.get("BURN_VIDEO", "1").strip() not in ("0", "false", "no", "off")
+# 默认不烧录: 只有显式 BURN_VIDEO=1/true 才烧(原缺省值是 "1" = 烧)
+BURN_VIDEO = os.environ.get("BURN_VIDEO", "0").strip() not in ("0", "false", "no", "off")
 BURN_DIR = os.environ.get("BURN_DIR", "字幕版")   # 输出子目录(相对源目录)
 # 烧制时字幕滤镜里要转义的字符(路径中的 : ' \ 等)
 def _ff_escape_path(p):
