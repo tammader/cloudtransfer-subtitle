@@ -66,6 +66,10 @@ MODEL_FB = os.environ.get("SUBTITLE_MODEL_FB", "qwen3.8-max")
 # whisper 模型: 默认 large-v3-turbo(编码器=large-v3, 解码器4层; 精度接近 large-v3, 速度 4-5x)
 #   兼容口径: 接受 "large-v3-turbo" / "turbo" 等别名, 内部映射到 HF 上可直连下载的 CT2 仓库
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+# 翻译开关: 关闭时只输出日语转写 srt, 完全不调翻译网关
+# (仓库 Variables 设 TRANSLATE_ZH=true 可恢复日译中)
+_tz = (os.environ.get("TRANSLATE_ZH") or "1").strip().lower()
+TRANSLATE_ZH = _tz not in ("0", "false", "no", "off")
 # 别名 -> HF 仓库(仅当传入的是别名而非真实路径/仓库时使用)
 _WHISPER_ALIAS = {
     "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
@@ -537,6 +541,17 @@ def _fmt_ts(sec):
     return "%02d:%02d:%02d,%03d" % (h, m, s, mm)
 
 
+def translate_or_passthrough(segs):
+    """TRANSLATE_ZH 关闭时直接返回日语转写(不调网关); 开启时走正常翻译。
+
+    注意: --fix-srt 修复模式不走这里 —— 它存在的意义就是重新翻译。
+    """
+    if not TRANSLATE_ZH:
+        log("翻译已关闭(TRANSLATE_ZH=0) -> 只输出日语 srt, 本条 %d 段" % len(segs))
+        return [(s[0], s[1], s[2]) for s in segs]
+    return translate_segments(segs)
+
+
 def write_srt(segs, path):
     with io.open(path, "w", encoding="utf-8", newline="\n") as f:
         for n, (st, en, txt) in enumerate(segs, 1):
@@ -716,7 +731,7 @@ def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0, bu
     if not segs:
         log("!! 无字幕段, 跳过")
         return
-    zh = translate_segments(segs)
+    zh = translate_or_passthrough(segs)
     srt_local = os.path.join(gdir, "out.srt")
     write_srt(zh, srt_local)
     srt_name = "%s.srt" % base
