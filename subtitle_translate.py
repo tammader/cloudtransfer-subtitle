@@ -807,14 +807,16 @@ def main():
             targets.append(base)
         log("修复模式: 有srt组=%d, 目标=%d" % (len(existing), len(targets)))
     else:
+        # 索引稳定性: targets 必须包含"全部组"(按大小升序, 顺序确定),
+        # 已完成的组在循环内部廉价跳过。否则列表随组完成而收缩, start_index 会漂移,
+        # 导致批次重复干同一组 / 指到空处空转(实测 144 run 只出 54 srt)。
         targets = []
         for base in order_by_size:
-            if base in existing and not a.force:
-                continue
             if a.only and base != a.only:
                 continue
             targets.append(base)
-        log("待处理组=%d (已跳过 %d 个已有srt; 按大小升序)" % (len(targets), len(existing)))
+        log("全部组=%d (其中已有srt %d 个, 会在循环里跳过; 按大小升序)"
+            % (len(targets), len(existing)))
 
     if a.list:
         for b in targets:
@@ -836,6 +838,9 @@ def main():
         if time.time() > deadline:
             log("!! 到达时间预算, 收工")
             break
+        if base in existing and not a.force:
+            # 已有 srt -> 幂等跳过(不下载/不转写), 保持索引稳定
+            continue
         try:
             if a.fix_srt:
                 fix_srt_group(SRC_REMOTE, SRC_DIR, base, groups[base], workdir, a.apply,
