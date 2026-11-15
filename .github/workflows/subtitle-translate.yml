@@ -166,6 +166,8 @@ jobs:
           LIMIT_GROUPS: ${{ inputs.limit_groups || '1' }}
           BUDGET_MIN: ${{ inputs.budget_min || '300' }}
           WHISPER_MODEL: ${{ inputs.whisper_model || 'large-v3-turbo' }}
+          # 翻译开关: false=只出日语 srt(不调翻译网关); true=日译中
+          TRANSLATE_ZH: ${{ vars.TRANSLATE_ZH || 'false' }}
           PROBE_ONLY: ${{ inputs.probe_only || '0' }}
           START_INDEX: ${{ inputs.start_index || '0' }}
           # 源子目录(调度器按目录轮转派发); 留空则回落到 PATHS_JSON 的 SUB_DIR
