@@ -552,6 +552,30 @@ def translate_or_passthrough(segs):
     return translate_segments(segs)
 
 
+def raw_base(fname):
+    """组基名 —— 保留 已处理_ 前缀, 只去掉最外层 .partNNN[_X] 与扩展名。"""
+    if fname.lower().endswith(".srt"):
+        return fname[:-4]
+    m = _RE_PART.search(fname)
+    if m:
+        return m.group("base")
+    mp = _RE_PLAIN.search(fname)
+    if mp:
+        return mp.group("base")
+    return fname.rsplit(".", 1)[0]
+
+
+def srt_base_of(parts):
+    """该组 srt 的落盘基名。
+
+    单文件组: 直接用视频文件名(去扩展名) -> srt 与视频完全同名。
+    多分片组: 没有单个视频可对应, 用组基名(保留 已处理_), 一个组一个 srt。
+    """
+    if len(parts) == 1:
+        return parts[0][1].rsplit(".", 1)[0]
+    return raw_base(parts[0][1])
+
+
 def write_srt(segs, path):
     with io.open(path, "w", encoding="utf-8", newline="\n") as f:
         for n, (st, en, txt) in enumerate(segs, 1):
@@ -734,7 +758,8 @@ def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0, bu
     zh = translate_or_passthrough(segs)
     srt_local = os.path.join(gdir, "out.srt")
     write_srt(zh, srt_local)
-    srt_name = "%s.srt" % base
+    # srt 与视频同名: 单文件组=视频名(完全同名); 多分片组=组名
+    srt_name = "%s.srt" % srt_base_of(parts)
     rc, out, err = run(["rclone", "copyto", srt_local, "%s:%s/%s" % (remote, path, srt_name),
                         "--retries", "3"])
     log("上传 srt -> rc=%d (%.1fs)" % (rc, time.time() - t0))
@@ -853,8 +878,8 @@ def main():
         if time.time() > deadline:
             log("!! 到达时间预算, 收工")
             break
-        if base in existing and not a.force:
-            # 已有 srt -> 幂等跳过(不下载/不转写), 保持索引稳定
+        if srt_base_of(groups[base]) in existing and not a.force:
+            # 已有同名 srt -> 幂等跳过(不下载/不转写), 保持索引稳定
             continue
         try:
             if a.fix_srt:
