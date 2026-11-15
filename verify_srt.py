@@ -37,6 +37,9 @@ SRC_REMOTE = os.environ.get("SUB_SRC") or pathcfg.get("SUB_SRC", "")
 SRC_DIR = os.environ.get("SUB_DIR") or pathcfg.get("SUB_DIR", "out3")
 
 _KANA = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+# 当前文件是否属于"只出日语 srt"模式的产物(整份几乎全是日文)
+# 这种文件里假名是预期内容, 不该判成"日文残留"
+_JA_MODE = [False]
 _LEAK = ("the user", "i need", "i should", "let me", "translate", "translation",
          "用户想", "用户希望", "需要翻译", "翻译成", "we need", "sure,", "当然，以下是",
          "以下是", "好的，", "assistant")
@@ -71,7 +74,7 @@ def bad_reason(text):
     t = (text or "").strip()
     if not t:
         return "空"
-    if _KANA.search(t):
+    if not _JA_MODE[0] and _KANA.search(t):
         return "日文残留"
     low = t.lower()
     for w in _LEAK:
@@ -138,6 +141,9 @@ def main():
         for fn in names:
             segs = parse_srt(os.path.join(tmp, fn))
             n = len(segs)
+            # 自适应: 整份几乎全是日文 => "只出日语 srt"模式的产物
+            _kana_n = sum(1 for s in segs if _KANA.search(s))
+            _JA_MODE[0] = bool(n) and (_kana_n >= max(1, int(n * 0.8)))
             bad = [s for s in segs if bad_reason(s)]
             nb = len(bad)
             tot_seg += n
