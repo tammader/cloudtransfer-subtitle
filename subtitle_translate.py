@@ -816,6 +816,20 @@ def main():
     # 目标顺序: 按组总大小升序(小的先做, 巨型文件排最后, 避免阻塞)
     order_by_size = sorted(groups.keys(), key=lambda b: gsizes.get(b, 0))
 
+    # 口径自检: 盘上 srt 数 vs 能对上组名的 srt 数。
+    # 对不上 = 命名规则变过(改名/迁移遗留), 这部分会把已完成组重新算成待办。
+    _base_names = set()
+    for _b in order_by_size:
+        try:
+            _base_names.add(srt_base_of(groups[_b]))
+        except Exception:
+            _base_names.add(_b)
+    _orphan = sorted(n for n in existing if n not in _base_names)
+    log("已有srt=%d 个 (与组名对得上=%d, 对不上=%d)" % (
+        len(existing), len(existing) - len(_orphan), len(_orphan)))
+    if _orphan:
+        log("对不上的 srt 例: %s" % ", ".join(_orphan[:3]))
+
     if a.burn_only:
         # 补烧模式: 目标 = 有 srt 但 字幕版/ 里还没有对应 <番号>_字幕版.mp4 的组
         burn_names = set()
@@ -894,6 +908,9 @@ def main():
             log("!! 组处理失败: %s" % str(e)[:200])
     shutil.rmtree(workdir, ignore_errors=True)
     log("完成: ok=%d fail=%d" % (ok, fail))
+    if ok == 0 and fail == 0 and targets:
+        log("!! 本批 0 产出: 窗口内 %d 组全部已有 srt —— start_index=%d 已过期, 检查 subtitle_dispatch 的派发位置"
+            % (len(targets), a.start_index))
 
 
 if __name__ == "__main__":
