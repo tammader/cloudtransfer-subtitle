@@ -1,4 +1,7 @@
 name: subtitle-translate
+# run-name 里带上派发位置: subtitle_dispatch 靠它算「哪些下标已被在跑的批次占住」,
+# 避免相邻批次重复派发/窗口不前进(旧写法只看活跃数, 永远只覆盖前 ~21 个下标)。
+run-name: subtitle-translate si=${{ inputs.start_index || '0' }} g=${{ inputs.limit_groups || '1' }} dir=${{ inputs.sub_dir || 'default' }}
 
 # 日文语音视频 → 中文 SRT 字幕(纯云端)
 #   分片按「番号」归组 → ffmpeg 拼整片 → faster-whisper(large-v3-turbo) 日文转写
@@ -215,6 +218,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 与 subtitle-dispatch.yml 用同一套旋钮, 否则两边算出来的窗口宽度不一致
+          PHASE: translate
+          TARGET_PARALLEL: ${{ vars.TARGET_PARALLEL || '6' }}
+          GROUPS_PER_RUN: ${{ vars.GROUPS_PER_RUN || '3' }}
         run: |
           # 随机错峰 0-25s, 避免多批同时收尾时一起 dispatch 造成重复补发
           sleep $((RANDOM % 25))
