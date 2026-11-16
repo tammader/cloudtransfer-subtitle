@@ -5,7 +5,7 @@ name: subtitle-dispatch
 #   - 待办=0 且近期无活动 -> 打日志"翻译全部完成"(TG 已取消)
 #   全流程只出日文 srt: 不翻译、不烧录。
 # 从此不依赖本机/会话在线 —— 全流程云上闭环。
-# Secrets: GH_TOKEN / RCLONE_CONF / PATHS_JSON
+# Secrets: GH_TOKEN / RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
 
 on:
   schedule:
@@ -25,6 +25,9 @@ permissions:
 env:
   GH_TOKEN: ${{ secrets.GH_TOKEN }}
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  # 派发失败时给 TG 发告警(静默 404 停摆的兜底)
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
   # 本调度器只负责派发转写批次: 只出日文 srt
   # 质量校验见 subtitle-verify.yml
   PHASE: translate
