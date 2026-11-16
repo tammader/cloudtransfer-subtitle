@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
-"""烧录前的 srt 质量闸门 —— 统一校验翻译结果, 通过后才允许进入烧录阶段。
+"""srt 质量校验 —— 当前流程「只出日文 srt, 不翻译, 不烧录」。
 
 扫描源目录里所有 .srt, 逐条检查:
-  - 日文假名残留(没翻译干净)
-  - 思考过程泄漏(the user / i need / 用户想 ...)
   - 空条目
-按文件汇总坏条目占比, 给出全局结论; --gate 时以退出码卡住烧录批次。
+  - 思考过程/元信息泄漏(模型自述、英文 prompt 残留)
+  - 单条过长(字数或时长) —— 说明没切成字幕行
+  - 非日文内容(既无假名也无汉字, 基本是杂音/英文乱码)
+按文件汇总坏条目占比, 给出全局结论; --gate 时以退出码标红(非 0)。
 
 用法:
-  python3 verify_srt.py                        # 打印报告(不发 TG)
+  python3 verify_srt.py                        # 打印报告
   python3 verify_srt.py --json                 # 机器可读
-  python3 verify_srt.py --tg                   # 报告发 Telegram
-  python3 verify_srt.py --gate                 # 闸门: 超阈值 exit 1
+  python3 verify_srt.py --tg                   # (兼容参数) 报告打日志
+  python3 verify_srt.py --gate                 # 超阈值 exit 1(只看结论)
   python3 verify_srt.py --gate --max-bad-file-ratio 0.02 --max-bad-seg-ratio 0.05
 
-环境: RCLONE_CONF(已写入 ~/.config/rclone) / PATHS_JSON(SUB_SRC/SUB_DIR) /
-      TG_TOKEN / TG_CHAT_ID(可选, 只有 --tg 需要)
+环境: RCLONE_CONF(已写入 ~/.config/rclone) / PATHS_JSON(SUB_SRC/SUB_DIR)
+      (TG 已取消, 报告只进 run 日志)
 """
 import argparse
 import io
@@ -37,12 +38,16 @@ SRC_REMOTE = os.environ.get("SUB_SRC") or pathcfg.get("SUB_SRC", "")
 SRC_DIR = os.environ.get("SUB_DIR") or pathcfg.get("SUB_DIR", "out3")
 
 _KANA = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
-# 当前文件是否属于"只出日语 srt"模式的产物(整份几乎全是日文)
-# 这种文件里假名是预期内容, 不该判成"日文残留"
-_JA_MODE = [False]
-_LEAK = ("the user", "i need", "i should", "let me", "translate", "translation",
-         "用户想", "用户希望", "需要翻译", "翻译成", "we need", "sure,", "当然，以下是",
-         "以下是", "好的，", "assistant")
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+# 元信息/思考泄漏的强特征(注意: 日文对白里出现「好的」不影响, 这里只看英文自述与译文前缀)
+_LEAK_HEAD = ("the user", "i need", "i should", "let me", "we need",
+              "translate the", "translation:", "as follows", "以下是翻译", "以下是译文")
+_LEAK_ANY = ("用户想", "用户希望", "需要翻译", "翻译成中文", "assistant:", "sure, here")
+# 单条上限(与 translate 的 MAX_SEG_DUR / MAX_SEG_CHARS 对齐, 稍放宽作为阈值)
+MAX_SEG_DUR = float(os.environ.get("MAX_SEG_DUR", "8"))
+MAX_SEG_CHARS = int(os.environ.get("MAX_SEG_CHARS", "42"))
+_TOL_DUR = MAX_SEG_DUR + 2.0
+_TOL_CHARS = MAX_SEG_CHARS + 18
 
 
 def log(m):
@@ -50,9 +55,16 @@ def log(m):
 
 
 def parse_srt(path):
-    """只取每条的字幕文本(时间轴不需要)"""
+    """返回 [(text, dur_sec)]"""
     txt = io.open(path, encoding="utf-8", errors="replace").read()
     out = []
+
+    def _ts(s):
+        s = s.strip()
+        hh, mm, rest = s.split(":")
+        ss, ms = rest.split(",")
+        return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
     for blk in re.split(r"\r?\n\r?\n", txt.strip()):
         lines = [l for l in blk.splitlines() if l.strip()]
         if len(lines) < 2:
@@ -64,22 +76,36 @@ def parse_srt(path):
                 break
         if ti is None:
             continue
+        dur = 0.0
+        try:
+            a, b = lines[ti].split("-->")
+            dur = max(0.0, _ts(b) - _ts(a))
+        except Exception:
+            pass
         text = " ".join(lines[ti + 1:]).strip()
-        if text:
-            out.append(text)
+        out.append((text, dur))
     return out
 
 
-def bad_reason(text):
+def bad_reason(text, dur=None):
+    """坏条目判定(日文 srt 版): 空 / 泄漏 / 过长 / 非日文"""
     t = (text or "").strip()
     if not t:
         return "空"
-    if not _JA_MODE[0] and _KANA.search(t):
-        return "日文残留"
     low = t.lower()
-    for w in _LEAK:
+    head = low[:40]
+    for w in _LEAK_HEAD:
+        if w in head:
+            return "元信息泄漏"
+    for w in _LEAK_ANY:
         if w in low:
-            return "思考泄漏"
+            return "元信息泄漏"
+    if dur and dur > _TOL_DUR:
+        return "单条过长(%.0fs)" % dur
+    if len(t) > _TOL_CHARS:
+        return "单条过长(%d字)" % len(t)
+    if not _KANA.search(t) and not _CJK.search(t):
+        return "非日文内容"
     return None
 
 
@@ -95,23 +121,9 @@ def fetch_srt(tmpdir):
 
 
 def tg_send(text):
-    tok = os.environ.get("TG_TOKEN", "")
-    chat = os.environ.get("TG_CHAT_ID", "")
-    if not tok or not chat:
-        log("!! 缺 TG_TOKEN/TG_CHAT_ID, 不发 TG")
-        return False
-    import urllib.parse
-    import urllib.request
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900],
-                                   "disable_web_page_preview": "true"}).encode()
-    req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok, data=data,
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as x:
-            return bool(json.loads(x.read().decode("utf-8", "replace")).get("ok"))
-    except Exception as e:
-        log("!! 发 TG 失败: %s" % str(e)[:120])
-        return False
+    """TG 已取消: 报告只打日志"""
+    log(text)
+    return True
 
 
 def main():
@@ -141,10 +153,7 @@ def main():
         for fn in names:
             segs = parse_srt(os.path.join(tmp, fn))
             n = len(segs)
-            # 自适应: 整份几乎全是日文 => "只出日语 srt"模式的产物
-            _kana_n = sum(1 for s in segs if _KANA.search(s))
-            _JA_MODE[0] = bool(n) and (_kana_n >= max(1, int(n * 0.8)))
-            bad = [s for s in segs if bad_reason(s)]
+            bad = [(t, d) for t, d in segs if bad_reason(t, d)]
             nb = len(bad)
             tot_seg += n
             tot_bad += nb
@@ -154,7 +163,7 @@ def main():
                 "bad": nb,
                 "bad_ratio": (nb / n) if n else 0.0,
                 "whole_untranslated": bool(n and nb / n >= 0.9),
-                "sample_reason": bad_reason(bad[0]) if bad else None,
+                "sample_reason": bad_reason(bad[0][0], bad[0][1]) if bad else None,
             })
 
         bad_files = [f for f in files if f["bad"] > 0]

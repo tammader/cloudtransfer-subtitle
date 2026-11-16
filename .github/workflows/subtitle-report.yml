@@ -1,8 +1,8 @@
 name: subtitle-report
 
-# 字幕批量进度报告 -> Telegram(定时 + 手动)
-#   统计源目录 srt 数 / 硬字幕数 / 待处理组数, 结合最近运行状态, 发一条 TG 消息。
-# Secrets: RCLONE_CONF(gdrive6) / PATHS_JSON(SUB_SRC/SUB_DIR) / TG_TOKEN / TG_CHAT_ID / GH_TOKEN
+# 字幕批量进度报告 -> run 日志(定时 + 手动, TG 已取消)
+#   统计源目录 srt 数 / 硬字幕数 / 待处理组数, 结合最近运行状态打日志。
+# Secrets: RCLONE_CONF / PATHS_JSON / GH_TOKEN
 
 on:
   schedule:
@@ -21,8 +21,6 @@ permissions:
 
 env:
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
-  TG_TOKEN: ${{ secrets.TG_TOKEN }}
-  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
   GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
 jobs:
@@ -47,5 +45,5 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: 统计并发送报告
+      - name: 统计并打印报告
         run: python3 subtitle_progress.py

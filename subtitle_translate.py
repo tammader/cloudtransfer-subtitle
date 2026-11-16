@@ -2,10 +2,10 @@
 """日文视频 → 中文 SRT 字幕流水线(云端 runner 用)
 
 流程:
-  1. 列出源远端(如 gdrive6)目标目录(默认 out3)的 mp4 分片
+  1. 列出源远端目标目录(默认 out3)的 mp4 分片
   2. 按「番号」归组(去掉 已处理_ 前缀 / .partNNN_D 后缀)
   3. 每组的 .partNNN 分片按序号用 ffmpeg concat 拼成整片(单分片直接拷)
-  4. faster-whisper (large-v3-turbo) 做日文语音转写 -> 日文 srt 段
+  4. faster-whisper (large-v3) 做日文语音转写 -> 日文 srt 段
   5. 调 OpenAI 兼容翻译网关, 每 N 条一批译成简体中文(保留时间轴)
   6. 写中文 .srt, 上传回源远端同目录, 文件名 = <番号>.srt
   7. run 结束前清理本地临时文件(可选)
@@ -63,13 +63,9 @@ API_BASE = os.environ.get("SUBTITLE_API_BASE", "").rstrip("/")
 API_KEY = os.environ.get("SUBTITLE_API_KEY", "")
 MODEL = os.environ.get("SUBTITLE_MODEL", "glm-5.3")
 MODEL_FB = os.environ.get("SUBTITLE_MODEL_FB", "qwen3.8-max")
-# whisper 模型: 默认 large-v3-turbo(编码器=large-v3, 解码器4层; 精度接近 large-v3, 速度 4-5x)
+# whisper 模型: 默认 large-v3(全量, 日语最准; large-v3-turbo 快 4-5x 但精度略低)
 #   兼容口径: 接受 "large-v3-turbo" / "turbo" 等别名, 内部映射到 HF 上可直连下载的 CT2 仓库
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
-# 翻译开关: 关闭时只输出日语转写 srt, 完全不调翻译网关
-# (仓库 Variables 设 TRANSLATE_ZH=true 可恢复日译中)
-_tz = (os.environ.get("TRANSLATE_ZH") or "1").strip().lower()
-TRANSLATE_ZH = _tz not in ("0", "false", "no", "off")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 # 别名 -> HF 仓库(仅当传入的是别名而非真实路径/仓库时使用)
 _WHISPER_ALIAS = {
     "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
@@ -85,8 +81,9 @@ def resolve_whisper_model(name):
     key = (name or "").strip().lower()
     return _WHISPER_ALIAS.get(key, name)
 # --- 速度旋钮(都可用仓库 Variables 覆盖, 不改代码) ---
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))        # 每请求条数: 10 -> 50
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))        # 每请求条数上限
 XLATE_CONC = int(os.environ.get("XLATE_CONC", "4"))        # 并发翻译请求数(网关 503 敏感, 别超 6)
+XLATE_MAX_CHARS = int(os.environ.get("XLATE_MAX_CHARS", "1800"))  # 每请求总字长上限(防模型输出截断)
 WHISPER_THREADS = int(os.environ.get("WHISPER_THREADS", "4"))
 WHISPER_BATCH = int(os.environ.get("WHISPER_BATCH", "8"))  # 批量推理批大小(BatchedInferencePipeline)
 WHISPER_BEAM = int(os.environ.get("WHISPER_BEAM", "1"))    # 1=贪心, 最快
@@ -292,14 +289,102 @@ def transcribe(video_path, whisper_model, max_seconds=0):
     if not out and not max_seconds:
         log("!! 放宽 VAD 仍无字幕, 回退到无 VAD 全量转写")
         out = _run(False)
-    log("转写完成: %d 条字幕" % len(out))
+    log("转写完成: %d 条(重切前)" % len(out))
+    out = split_long_segments(out)
+    log("转写完成: %d 条(按标点重切后, 单条<=%.0fs)" % (len(out), MAX_SEG_DUR))
     return out
 
 
-# ---------------- 翻译 ----------------
+# ---------------- 长段重切(字幕后处理) ----------------
+# 批量推理管线会把整段对白并成 30~200 秒的长块, 直接当字幕不可用:
+# 这里按标点切成句, 再按字长比例分配时间, 保证单条 <= MAX_SEG_DUR 秒、<= MAX_SEG_CHARS 字。
+MAX_SEG_DUR = float(os.environ.get("MAX_SEG_DUR", "8"))
+MAX_SEG_CHARS = int(os.environ.get("MAX_SEG_CHARS", "42"))
+_PUNCT_SPLIT = re.compile(r"(?<=[。、，！？!?…．])")
+
+def _sentences(tx):
+    s = [x.strip() for x in _PUNCT_SPLIT.split(tx) if x and x.strip()]
+    return s or [tx]
+
+
+_LETTER = re.compile(r"[ぁ-んァ-ヶー一-龥A-Za-z0-9]")
+
+
+def split_long_segments(segs, max_dur=None, max_chars=None):
+    """把过长的转写段按标点/字长重切成字幕行, 时间按字长比例分配。
+
+    segs: [(start, end, text)] -> [(start, end, text)]  (单条 dur<=max_dur, 字数<=max_chars)
+    纯标点/纯符号的段(如只剩一个「、」)直接丢掉, 不单独成行。
+    """
+    max_dur = max_dur or MAX_SEG_DUR
+    max_chars = max_chars or MAX_SEG_CHARS
+    out = []
+    for st, en, tx in segs:
+        tx = (tx or "").strip()
+        if not tx or not _LETTER.search(tx):
+            continue
+        dur = max(0.3, en - st)
+        if dur <= max_dur and len(tx) <= max_chars:
+            out.append((st, en, tx))
+            continue
+        # 纯标点的句子并到上一句, 避免出现只有「、」这种行
+        sents = []
+        for s in _sentences(tx):
+            if _LETTER.search(s):
+                sents.append(s)
+            elif sents:
+                sents[-1] += s
+        if not sents:
+            continue
+        per_char = dur / max(1, len(tx))                      # 每字多少秒
+        cap = max(6, min(max_chars, int(max_dur / per_char)))  # 本段内每行最多几个字
+        lines, cur = [], ""
+        for s in sents:
+            while len(s) > cap:                                # 单句超长 -> 硬切
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                lines.append(s[:cap])
+                s = s[cap:]
+            if not cur:
+                cur = s
+            elif len(cur) + len(s) <= cap:
+                cur += s
+            else:
+                lines.append(cur)
+                cur = s
+        if cur:
+            lines.append(cur)
+        t = st
+        for ln in lines:
+            d = len(ln) * per_char
+            d = max(0.6, min(max_dur, d))
+            e = min(en, t + d)
+            if e - t < 0.4:
+                e = min(en, t + 0.4)
+            out.append((round(t, 2), round(e, 2), ln))
+            t = e
+            if t >= en - 0.01:
+                break
+    return out
+
+
+# ---------------- 翻译(默认关闭) ----------------
+class TranslationIncomplete(RuntimeError):
+    """有字幕条目拿不到合格译文 —— 整组失败, 不写 srt, 留待下一轮重试"""
+
+
+# 是否做中译: 默认 **关**(只出日文 srt)。要恢复翻译设 TRANSLATE=on / 1 / zh
+TRANSLATE_ON = (os.environ.get("TRANSLATE", "off").strip().lower()
+                in ("1", "on", "true", "yes", "zh", "translate"))
+QUALITY = (os.environ.get("QUALITY") or "high").strip().lower()
+# high 档: 低温度 + 两次采样取优, 换质量提升
+TEMPERATURE = 0.1 if QUALITY == "high" else 0.2
+SAMPLES = 2 if QUALITY == "high" else 1
+
 def _post_chat(model, messages, timeout=120):
     body = json.dumps({"model": model, "messages": messages,
-                       "temperature": 0.2, "max_tokens": 8000, "stream": False}).encode()
+                       "temperature": TEMPERATURE, "max_tokens": 8000, "stream": False}).encode()
     req = urllib.request.Request(API_BASE + "/chat/completions", data=body,
                                  headers={"Authorization": "Bearer " + API_KEY,
                                           "Content-Type": "application/json",
@@ -317,7 +402,12 @@ TERMS_FILE = (os.environ.get("TERMS_FILE") or "translate_terms.json").strip()
 
 _BASE_SYS = ("你是专业的日译中字幕翻译。你会收到一个 JSON 数组, 每个元素是 {i, t} 字幕条目。"
              "请把每条 t 从日文翻译成简洁自然的简体中文, 保持口语化、符合字幕习惯。"
-             "严格只返回一个 JSON 数组, 每个元素 {\"i\": 原i, \"z\": 中文译文}, 顺序与输入一致, 不要任何解释或多余文字。")
+             "严格只返回一个 JSON 数组, 每个元素 {\"i\": 原i, \"z\": 中文译文}, 顺序与输入一致, 不要任何解释或多余文字。"
+             "\n\n硬性要求:"
+             "\n1. 译文里绝不允许出现任何日文假名(平假名/片假名)或罗马字。"
+             "\n2. 绝不输出思考过程、解释、前缀(如「翻译:」「好的」)——只输出译文本身。"
+             "\n3. 语气词、喘息、敬语按中文口语习惯自然表达, 不逐字直译。"
+             "\n4. 一条原文太长时拆成简洁短句, 符合字幕一屏可读。")
 
 
 def _terms_to_text(data):
@@ -409,22 +499,35 @@ _XLATE_SEM = threading.Semaphore(max(1, XLATE_CONC))
 def _translate_batch(payload, models=None, attempts=2):
     """翻译一批 [{i,t}], 返回 {i: zh}; 失败返回 None。
 
-    速度: 阶梯收窄(2 模型 × 2 次), 退避带抖动; 旧的 5 模型 × 4 次 × sleep 会拖到分钟级。
+    质量: QUALITY=high 时每个模型采样 SAMPLES 次, 用坏字计数挑最好的那次;
+          速度: 阶梯收窄(2 模型 × 2 次), 退避带抖动。
     """
     user = json.dumps(payload, ensure_ascii=False)
     for model in (models or _FAST_MODELS):
         for attempt in range(attempts):
             try:
-                with _XLATE_SEM:
-                    txt = _post_chat(model, [
-                        {"role": "system", "content": _SYS},
-                        {"role": "user", "content": user},
-                    ], timeout=180)
-                arr = _extract_json_array(txt)
-                if isinstance(arr, list) and len(arr) >= 1:
-                    got = {int(x["i"]): str(x["z"]).strip() for x in arr if "i" in x and "z" in x}
-                    if got:
-                        return got
+                samples = []
+                for _s in range(SAMPLES):
+                    with _XLATE_SEM:
+                        txt = _post_chat(model, [
+                            {"role": "system", "content": _SYS},
+                            {"role": "user", "content": user},
+                        ], timeout=180)
+                    arr = _extract_json_array(txt)
+                    if isinstance(arr, list) and len(arr) >= 1:
+                        got = {int(x["i"]): str(x["z"]).strip() for x in arr if "i" in x and "z" in x}
+                        if got:
+                            samples.append(got)
+                if samples:
+                    if len(samples) == 1:
+                        return samples[0]
+                    # 挑坏译文少的那次
+                    def _badness(d):
+                        return sum(1 for v in d.values() if _is_bad_translation(v))
+                    samples.sort(key=_badness)
+                    log("翻译批(len=%d) 采样%d次, 坏字数 %s -> 取最优" % (
+                        len(payload), len(samples), [ _badness(s) for s in samples ]))
+                    return samples[0]
                 log("翻译批(len=%d) 用 %s 返回不可解析(第%d次)" % (len(payload), model, attempt + 1))
             except Exception as e:
                 log("翻译批(len=%d) 用 %s 失败(第%d次): %s" % (len(payload), model, attempt + 1, str(e)[:100]))
@@ -452,11 +555,28 @@ def _translate_items(items, models=None, attempts=2):
     return out
 
 
+def _chunk_items(items, batch_size=None, max_chars=None):
+    """按「条数 + 总字长」双上限切批, 避免单请求 payload 过大导致模型输出截断/JSON 不合规。"""
+    batch_size = batch_size or BATCH_SIZE
+    max_chars = max_chars or XLATE_MAX_CHARS
+    out, cur, cur_len = [], [], 0
+    for it in items:
+        L = len(it[1] or "")
+        if cur and (len(cur) >= batch_size or cur_len + L > max_chars):
+            out.append(cur)
+            cur, cur_len = [], 0
+        cur.append(it)
+        cur_len += L
+    if cur:
+        out.append(cur)
+    return out
+
+
 def _translate_all(items, models=None, attempts=2):
     """把 [(全局i,text)] 并行分批翻译, 返回 {i: zh}。"""
     if not items:
         return {}
-    chunks = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    chunks = _chunk_items(items)
     out = {}
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, min(XLATE_CONC, len(chunks)))) as ex:
@@ -476,8 +596,13 @@ def _has_japanese(text):
     return bool(re.search(r"[\u3040-\u309f\u30a0-\u30ff]", text or ""))
 
 
-_LEAK_WORDS = ("the user", "i need", "i should", "let me", "translate", "translation",
-               "用户想", "用户希望", "需要翻译", "翻译成", "we need", "sure,", "当然，以下是")
+# 思考泄漏特征(与 verify_srt 同一套判定): 只看开头 40 字的强特征, 避免误伤正常对白
+_LEAK_HEAD = ("the user", "i need", "i should", "let me", "we need",
+              "下面把", "以下是翻译", "以下是译文", "翻译如下", "译文：", "译文:",
+              "translate the", "translation:", "as follows")
+_LEAK_ANY = ("用户想", "用户希望", "需要翻译", "翻译成中文", "assistant:", "sure, here")
+
+
 def _is_bad_translation(text):
     """坏译文: 含日文假名 / 泄漏思考过程 / 为空"""
     t = (text or "").strip()
@@ -486,20 +611,29 @@ def _is_bad_translation(text):
     if _has_japanese(t):
         return True
     low = t.lower()
-    for w in _LEAK_WORDS:
+    head = low[:40]
+    for w in _LEAK_HEAD:
+        if w in head:
+            return True
+    for w in _LEAK_ANY:
         if w in low:
             return True
     return False
 
 
-def _retranslate_bad(result, rounds=3):
-    """结果里仍是坏译文(日文/泄漏思考/空)的条目, 重新翻译, 直到合格或轮次用尽"""
+def _retranslate_bad(result, sources=None, rounds=5):
+    """结果里仍是坏译文(日文/泄漏思考/空)的条目, 用「原始日文」重新翻译, 直到合格或轮次用尽。
+    质量: 默认 5 轮, 每轮换全模型阶梯 + attempts=3"""
     for rd in range(rounds):
-        bad = [(i, r[2]) for i, r in enumerate(result) if _is_bad_translation(r[2])]
+        bad = []
+        for i, r in enumerate(result):
+            if _is_bad_translation(r[2]):
+                src = sources[i] if (sources and i < len(sources)) else r[2]
+                bad.append((i, src))
         if not bad:
             return result
         log("第%d轮补译: %d 条坏译文(日文/泄漏/空)" % (rd + 1, len(bad)))
-        got = _translate_all(bad, _RESCUE_MODELS, attempts=2)
+        got = _translate_all(bad, _RESCUE_MODELS, attempts=3)
         for i, _ in bad:
             zh = got.get(i)
             if zh and not _is_bad_translation(zh):
@@ -510,8 +644,18 @@ def _retranslate_bad(result, rounds=3):
     return result
 
 
-def translate_segments(segs):
-    """segs: [(start,end,text)] -> [(start,end,zh)]；并发分批 + 失败二分重试 + 日文残留补译"""
+def translate_segments(segs, allow_drop=False):
+    """segs: [(start,end,text)] -> [(start,end,zh)]；并发分批 + 失败二分重试 + 坏译文补译
+
+    质量: QUALITY=high 时并发上限提到 6(网关敏感, 超 6 容易 503)
+    兜底策略: **绝不把日文原文当译文写回**。补译轮结束后仍有坏条目 ->
+      默认抛 TranslationIncomplete(整组失败, 不写 srt, 留待下一轮重试);
+      allow_drop=True 时丢弃这些条目(宁缺勿错)。
+    """
+    if QUALITY == "high" and XLATE_CONC < 6:
+        globals()["XLATE_CONC"] = 6
+        globals()["_XLATE_SEM"] = threading.Semaphore(6)
+        log("质量档 high: XLATE_CONC 提到 6")
     total = len(segs)
     items = [(i, s[2]) for i, s in enumerate(segs)]
     got = _translate_all(items)
@@ -520,12 +664,21 @@ def translate_segments(segs):
     for i, s in enumerate(segs):
         zh = got.get(i)
         if not zh:
-            zh = s[2]   # 极端兜底: 只有彻底失败才会到这里, 之后由补译轮再救
+            zh = ""      # 缺失 -> 留空, 不写原文; 交给补译轮, 仍不行就整组失败
             miss += 1
         result[i] = (s[0], s[1], zh)
-    log("翻译完成 %d/%d 条(缺 %d)" % (total - miss, total, miss))
-    # 收尾: 补译所有坏译文(日文残留/泄漏思考/空)
-    result = _retranslate_bad(result)
+    log("翻译完成 %d/%d 条(缺 %d, 未翻译的留空不写原文)" % (total - miss, total, miss))
+    # 收尾: 补译所有坏译文(日文残留/泄漏思考/空) —— 用原始日文重译
+    result = _retranslate_bad(result, sources=[s[2] for s in segs])
+    bad_idx = [i for i, r in enumerate(result) if _is_bad_translation(r[2])]
+    if bad_idx:
+        if allow_drop:
+            log("!! 丢弃 %d 条无法合格翻译的条目(allow_drop)" % len(bad_idx))
+            result = [r for i, r in enumerate(result) if i not in set(bad_idx)]
+        else:
+            raise TranslationIncomplete(
+                "%d/%d 条无法得到合格译文(日文/泄漏/空), 本组不写 srt, 留待重试" % (
+                    len(bad_idx), total))
     return result
 
 
@@ -541,41 +694,6 @@ def _fmt_ts(sec):
     return "%02d:%02d:%02d,%03d" % (h, m, s, mm)
 
 
-def translate_or_passthrough(segs):
-    """TRANSLATE_ZH 关闭时直接返回日语转写(不调网关); 开启时走正常翻译。
-
-    注意: --fix-srt 修复模式不走这里 —— 它存在的意义就是重新翻译。
-    """
-    if not TRANSLATE_ZH:
-        log("翻译已关闭(TRANSLATE_ZH=0) -> 只输出日语 srt, 本条 %d 段" % len(segs))
-        return [(s[0], s[1], s[2]) for s in segs]
-    return translate_segments(segs)
-
-
-def raw_base(fname):
-    """组基名 —— 保留 已处理_ 前缀, 只去掉最外层 .partNNN[_X] 与扩展名。"""
-    if fname.lower().endswith(".srt"):
-        return fname[:-4]
-    m = _RE_PART.search(fname)
-    if m:
-        return m.group("base")
-    mp = _RE_PLAIN.search(fname)
-    if mp:
-        return mp.group("base")
-    return fname.rsplit(".", 1)[0]
-
-
-def srt_base_of(parts):
-    """该组 srt 的落盘基名。
-
-    单文件组: 直接用视频文件名(去扩展名) -> srt 与视频完全同名。
-    多分片组: 没有单个视频可对应, 用组基名(保留 已处理_), 一个组一个 srt。
-    """
-    if len(parts) == 1:
-        return parts[0][1].rsplit(".", 1)[0]
-    return raw_base(parts[0][1])
-
-
 def write_srt(segs, path):
     with io.open(path, "w", encoding="utf-8", newline="\n") as f:
         for n, (st, en, txt) in enumerate(segs, 1):
@@ -588,6 +706,55 @@ def _parse_ts(s):
     hh, mm, rest = s.split(":")
     ss, ms = rest.split(",")
     return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
+
+# ---------------- 同名 srt 命名 + 按分片切时间轴 ----------------
+def part_basenames(parts):
+    """[(idx, fname), ...] -> [去扩展名的文件名, ...]  —— 即每个视频文件该配的 srt 名(不带 .srt)"""
+    return [os.path.splitext(fn)[0] for _idx, fn in parts]
+
+
+def required_srt_names(parts):
+    """这个组「算做完」需要哪些 srt 文件名(带 .srt)"""
+    return set("%s.srt" % b for b in part_basenames(parts))
+
+
+def probe_duration(path):
+    """ffprobe 取媒体时长(秒); 失败返回 0.0"""
+    rc, out, err = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", path])
+    if rc != 0:
+        return 0.0
+    try:
+        return float((out or "").strip().splitlines()[0])
+    except Exception:
+        return 0.0
+
+
+def split_segments_by_parts(segs, durations):
+    """把「合并整片」时间轴的 segs 按各分片时长切成每片一份(时间轴改回该片内的相对时间)。
+
+    segs: [(start, end, text)] 相对合并整片起点
+    durations: [该组每个分片的时长(秒)], 顺序与分片一致
+    返回: [[(start_i, end_i, text), ...], ...]  每个分片一份
+    """
+    out = []
+    off = 0.0
+    for d in durations:
+        end = off + d
+        part = []
+        for st, en, tx in segs:
+            # 与该片区间有交集才留下
+            if en <= off + 0.05 or st >= end - 0.05:
+                continue
+            a = max(0.0, st - off)
+            b = min(d, en - off)
+            if b <= a:
+                b = min(d, a + 0.2)
+            part.append((a, b, tx))
+        out.append(part)
+        off = end
+    return out
 
 
 def parse_srt(path):
@@ -620,10 +787,11 @@ def parse_srt(path):
     return segs
 
 
-# ---------------- 硬字幕烧制 ----------------
-# 默认不烧录: 只有显式 BURN_VIDEO=1/true 才烧(原缺省值是 "1" = 烧)
-BURN_VIDEO = os.environ.get("BURN_VIDEO", "0").strip() not in ("0", "false", "no", "off")
-BURN_DIR = os.environ.get("BURN_DIR", "字幕版")   # 输出子目录(相对源目录)
+# ---------------- 硬字幕烧制(本流程已停用) ----------------
+# 流程已改为「只出 srt, 不烧录」: BURN_VIDEO 恒为 False,
+# 下面的 burn_subtitles 保留但不会被调用(要恢复烧录就把 BURN_VIDEO 改回读环境变量)。
+BURN_VIDEO = False
+BURN_DIR = os.environ.get("BURN_DIR", "字幕版")   # (当前流程不产出此目录)
 # 烧制时字幕滤镜里要转义的字符(路径中的 : ' \ 等)
 def _ff_escape_path(p):
     return p.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
@@ -668,53 +836,65 @@ def burn_subtitles(video_path, srt_local, base, remote, path, gdir):
     return rc2 == 0
 
 
-def fix_srt_group(remote, path, base, parts, workdir, apply, re_burn=True):
-    """修复模式: 下载已有 srt, 重新翻译其中文(替换日文残留), 写回修正 srt; 可选重烧硬字幕。
-    不重跑 whisper 转写。"""
-    log("修复组 srt (parts=%d, re_burn=%s)" % (len(parts), re_burn))
+def fix_srt_group(remote, path, base, parts, workdir, apply, re_burn=False):
+    """修复模式: 逐片下载「与视频同名的 srt」, 重新翻译(替换日文残留/泄漏), 写回同名 srt。
+    仅在 TRANSLATE=on 时有意义; 只出日文 srt 的模式下直接跳过。"""
+    if not TRANSLATE_ON:
+        log("修復模式已跳过: 当前 TRANSLATE=off(只出日文 srt, 没有可修的译文)")
+        return
+    names = part_basenames(parts)
+    log("修复组 srt (分片=%d)" % len(names))
     if not apply:
         return
     t0 = time.time()
     gdir = os.path.join(workdir, "grp")
     os.makedirs(gdir, exist_ok=True)
-    srt_local = os.path.join(gdir, "in.srt")
-    rc0, o0, e0 = run(["rclone", "copyto", "%s:%s/%s.srt" % (remote, path, base), srt_local, "--retries", "3"])
-    if rc0 != 0 or not os.path.exists(srt_local):
-        log("!! 下载 srt 失败, 跳过")
-        return
-    segs = parse_srt(srt_local)
-    log("解析 srt: %d 条" % len(segs))
-    if not segs:
-        return
-    ja_before = sum(1 for _, _, t in segs if _is_bad_translation(t))
-    log("坏译文条数(修前, 日文/泄漏/空): %d/%d" % (ja_before, len(segs)))
-    zh = translate_segments(segs)
-    ja_after = sum(1 for _, _, t in zh if _is_bad_translation(t))
-    log("坏译文条数(修后): %d/%d" % (ja_after, len(zh)))
-    out_srt = os.path.join(gdir, "fixed.srt")
-    write_srt(zh, out_srt)
-    rc, out, err = run(["rclone", "copyto", out_srt, "%s:%s/%s.srt" % (remote, path, base), "--retries", "3"])
-    log("回写修正 srt -> rc=%d (%.1fs)" % (rc, time.time() - t0))
-    if re_burn and BURN_VIDEO:
-        local_parts = download_group(remote, path, base, parts, gdir)
-        video = os.path.join(gdir, "merged.mp4")
-        concat_parts(local_parts, video)
+    n_fix = 0
+    for name in names:
+        srt_local = os.path.join(gdir, os.path.basename(name) + ".srt")
+        rc0, o0, e0 = run(["rclone", "copyto", "%s:%s/%s.srt" % (remote, path, name), srt_local,
+                           "--retries", "3"])
+        if rc0 != 0 or not os.path.exists(srt_local):
+            log("  跳过(无同名 srt): %s.srt" % name)
+            continue
+        segs = parse_srt(srt_local)
+        if not segs:
+            log("  跳过(解析出 0 条): %s.srt" % name)
+            continue
+        ja_before = sum(1 for _, _, t in segs if _is_bad_translation(t))
+        log("  %s.srt: 解析 %d 条, 坏译文(修前) %d" % (name, len(segs), ja_before))
         try:
-            burn_subtitles(video, out_srt, base, remote, path, gdir)
-        except Exception as e:
-            log("!! 重烧异常: %s" % str(e)[:200])
-        for p in local_parts + [video]:
+            zh = translate_segments(segs)
+        except TranslationIncomplete as e:
+            log("  !! 跳过(修不干净, 不覆盖原文件): %s" % e)
+            for p in [srt_local]:
+                try: os.remove(p)
+                except Exception: pass
+            continue
+        ja_after = sum(1 for _, _, t in zh if _is_bad_translation(t))
+        log("  %s.srt: 坏译文(修后) %d" % (name, ja_after))
+        out_srt = os.path.join(gdir, os.path.basename(name) + ".fixed.srt")
+        write_srt(zh, out_srt)
+        rc, out, err = run(["rclone", "copyto", out_srt, "%s:%s/%s.srt" % (remote, path, name),
+                            "--retries", "3"])
+        if rc == 0:
+            n_fix += 1
+        else:
+            log("  !! 回写失败 %s.srt: %s" % (name, err[:150]))
+        for p in [srt_local, out_srt]:
             try: os.remove(p)
             except Exception: pass
-    for p in [srt_local, out_srt]:
-        try: os.remove(p)
-        except Exception: pass
+    log("修复完成: %d/%d 份回写 (%.1fs)" % (n_fix, len(names), time.time() - t0))
 
 
 # ---------------- 主流程 ----------------
 def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0, burn_only=False):
     log("处理组 (parts=%d, probe=%s, burn_only=%s)" % (len(parts), probe_seconds or "off", burn_only))
     if not apply:
+        return
+    if burn_only:
+        # 补烧模式已停用(流程不再烧录)
+        log("!! 补烧模式已停用(BURN_VIDEO=False), 跳过该组")
         return
     t0 = time.time()
     gdir = os.path.join(workdir, "grp")
@@ -723,25 +903,6 @@ def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0, bu
     video = os.path.join(gdir, "merged.mp4")
     concat_parts(local_parts, video)
     log("拼接完成 -> %.1f MB" % (os.path.getsize(video) / 1048576.0))
-
-    if burn_only:
-        # 补烧模式: 已有 srt, 只需下载 srt + 拼片 + 烧制, 跳过转写/翻译
-        srt_local = os.path.join(gdir, "existing.srt")
-        rc0, o0, e0 = run(["rclone", "copyto", "%s:%s/%s.srt" % (remote, path, base), srt_local, "--retries", "3"])
-        if rc0 != 0 or not os.path.exists(srt_local) or os.path.getsize(srt_local) < 10:
-            log("!! 补烧: 下载已有 srt 失败, 跳过")
-            for p in local_parts + [video]:
-                try: os.remove(p)
-                except Exception: pass
-            return
-        try:
-            burn_subtitles(video, srt_local, base, remote, path, gdir)
-        except Exception as e:
-            log("!! 补烧硬字幕异常: %s" % str(e)[:200])
-        for p in local_parts + [video, srt_local]:
-            try: os.remove(p)
-            except Exception: pass
-        return
 
     segs = transcribe(video, WHISPER_MODEL, max_seconds=probe_seconds)
     if probe_seconds:
@@ -755,24 +916,49 @@ def process_group(remote, path, base, parts, workdir, apply, probe_seconds=0, bu
     if not segs:
         log("!! 无字幕段, 跳过")
         return
-    zh = translate_or_passthrough(segs)
-    srt_local = os.path.join(gdir, "out.srt")
-    write_srt(zh, srt_local)
-    # srt 与视频同名: 单文件组=视频名(完全同名); 多分片组=组名
-    srt_name = "%s.srt" % srt_base_of(parts)
-    rc, out, err = run(["rclone", "copyto", srt_local, "%s:%s/%s" % (remote, path, srt_name),
-                        "--retries", "3"])
-    log("上传 srt -> rc=%d (%.1fs)" % (rc, time.time() - t0))
-    if rc != 0:
-        log("!! 上传失败: %s" % err[:200])
-    # 硬字幕(可选): 把 srt 烧进整片, 上传到 字幕版/ 子目录
-    if BURN_VIDEO:
+    if TRANSLATE_ON:
         try:
-            burn_subtitles(video, srt_local, base, remote, path, gdir)
-        except Exception as e:
-            log("!! 硬字幕步骤异常: %s" % str(e)[:200])
+            zh = translate_segments(segs)
+        except TranslationIncomplete as e:
+            log("!! 组失败(不写 srt, 留待重试): %s" % e)
+            for p in local_parts + [video]:
+                try: os.remove(p)
+                except Exception: pass
+            raise
+    else:
+        zh = segs      # 不翻译: 直接用日文转写结果出 srt
+        log("翻译已关闭(TRANSLATE=off): 直接输出日文 srt, 共 %d 条" % len(zh))
+
+    # ---- 每片一份同名 srt: 合并时间轴按分片时长切开, 时间轴改回片内相对时间 ----
+    names = part_basenames(parts)
+    if len(local_parts) == 1:
+        per_part = [zh]
+    else:
+        durs = [probe_duration(p) for p in local_parts]
+        if all(d > 0 for d in durs):
+            log("分片时长: %s 秒" % ", ".join("%.1f" % d for d in durs))
+            per_part = split_segments_by_parts(zh, durs)
+        else:
+            log("!! 分片时长探测失败(%s) —— 退化为只给首片写整份 srt" % durs)
+            per_part = [zh if i == 0 else [] for i in range(len(local_parts))]
+
+    n_up = 0
+    for name, ss in zip(names, per_part):
+        if not ss:
+            log("  跳过(该片无字幕段): %s.srt" % name)
+            continue
+        local_srt = os.path.join(gdir, os.path.basename(name) + ".srt")
+        write_srt(ss, local_srt)
+        rc, out, err = run(["rclone", "copyto", local_srt,
+                            "%s:%s/%s.srt" % (remote, path, name), "--retries", "3"])
+        if rc != 0:
+            log("!! 上传失败 %s.srt: %s" % (name, err[:200]))
+        else:
+            n_up += 1
+    log("上传同名 srt -> %d/%d 份 (%.1fs)" % (n_up, len(names), time.time() - t0))
+
     # 清理
-    for p in local_parts + [video, srt_local]:
+    for p in local_parts + [video]:
         try:
             os.remove(p)
         except Exception:
@@ -789,7 +975,7 @@ def main():
     ap.add_argument("--probe-only", type=int, default=0, help="只转写前 N 秒做验证(不上传)")
     ap.add_argument("--start-index", type=int, default=0, help="从待处理列表第 K 个开始(并行分批用)")
     ap.add_argument("--force", action="store_true", help="配合 --only: 即使已有 srt 也强制重跑(测试硬字幕用)")
-    ap.add_argument("--burn-only", action="store_true", help="补烧模式: 对有 srt 但缺字幕版视频的组, 只拼片+烧制(不重跑转写)")
+    ap.add_argument("--burn-only", action="store_true", help="(已停用) 补烧模式; 当前流程不烧录, 传了会直接报错退出")
     ap.add_argument("--fix-srt", action="store_true", help="修复模式: 重译已有 srt 的日文残留, 写回并可选重烧硬字幕")
     ap.add_argument("--no-reburn", action="store_true", help="配合 --fix-srt: 只修 srt 不重烧视频")
     a = ap.parse_args()
@@ -810,67 +996,37 @@ def main():
     gsizes = group_sizes(files, groups)
     log("归组后=%d 组" % len(groups))
 
-    # 已存在 srt 的组跳过(幂等)
-    existing = set(fn[:-4] for fn, _sz in files if fn.lower().endswith(".srt"))
+    # 幂等: 组内「每个视频文件都已有同名 srt」才算做完
+    present_srt = set(fn for fn, _sz in files if fn.lower().endswith(".srt"))
+    done_groups = set()
+    for b, parts in groups.items():
+        if required_srt_names(parts) <= present_srt:
+            done_groups.add(b)
 
     # 目标顺序: 按组总大小升序(小的先做, 巨型文件排最后, 避免阻塞)
     order_by_size = sorted(groups.keys(), key=lambda b: gsizes.get(b, 0))
 
-    # 口径自检: 盘上 srt 数 vs 能对上组名的 srt 数。
-    # 对不上 = 命名规则变过(改名/迁移遗留), 这部分会把已完成组重新算成待办。
-    _base_names = set()
-    for _b in order_by_size:
-        try:
-            _base_names.add(srt_base_of(groups[_b]))
-        except Exception:
-            _base_names.add(_b)
-    _orphan = sorted(n for n in existing if n not in _base_names)
-    log("已有srt=%d 个 (与组名对得上=%d, 对不上=%d)" % (
-        len(existing), len(existing) - len(_orphan), len(_orphan)))
-    if _orphan:
-        log("对不上的 srt 例: %s" % ", ".join(_orphan[:3]))
-
     if a.burn_only:
-        # 补烧模式: 目标 = 有 srt 但 字幕版/ 里还没有对应 <番号>_字幕版.mp4 的组
-        burn_names = set()
-        try:
-            sub = rclone_lsf(SRC_REMOTE, "%s/%s" % (SRC_DIR, BURN_DIR))
-            for fn, _sz in sub:
-                if fn.lower().endswith(".mp4") and fn.endswith("_字幕版.mp4"):
-                    burn_names.add(fn[:-len("_字幕版.mp4")])
-        except Exception as e:
-            log("!! 列字幕版目录失败(可能不存在, 视为全缺): %s" % str(e)[:120])
-        targets = []
-        for base in order_by_size:
-            if base not in existing:
-                continue  # 没 srt 的组不补烧(等正常流程出 srt)
-            if base in burn_names:
-                continue  # 已有硬字幕视频
-            if a.only and base != a.only:
-                continue
-            targets.append(base)
-        log("补烧模式: 有srt组=%d, 已有字幕版=%d, 待补烧=%d" % (len(existing), len(burn_names), len(targets)))
+        raise SystemExit("!! 本流程已改为「只出 srt, 不烧录」, --burn-only 已停用")
     elif a.fix_srt:
-        # 修复模式: 扫描有 srt 的组(可按 --only 限定), 重译日文残留
+        # 修复模式: 扫描已有同名 srt 的组(可按 --only 限定), 重译日文残留
         targets = []
         for base in order_by_size:
-            if base not in existing:
+            if base not in done_groups:
                 continue
             if a.only and base != a.only:
                 continue
             targets.append(base)
-        log("修复模式: 有srt组=%d, 目标=%d" % (len(existing), len(targets)))
+        log("修复模式: 已完成组=%d, 目标=%d" % (len(done_groups), len(targets)))
     else:
-        # 索引稳定性: targets 必须包含"全部组"(按大小升序, 顺序确定),
-        # 已完成的组在循环内部廉价跳过。否则列表随组完成而收缩, start_index 会漂移,
-        # 导致批次重复干同一组 / 指到空处空转(实测 144 run 只出 54 srt)。
         targets = []
         for base in order_by_size:
+            if base in done_groups and not a.force:
+                continue
             if a.only and base != a.only:
                 continue
             targets.append(base)
-        log("全部组=%d (其中已有srt %d 个, 会在循环里跳过; 按大小升序)"
-            % (len(targets), len(existing)))
+        log("待处理组=%d (已跳过 %d 个已全片带字幕的组; 按大小升序)" % (len(targets), len(done_groups)))
 
     if a.list:
         for b in targets:
@@ -892,25 +1048,19 @@ def main():
         if time.time() > deadline:
             log("!! 到达时间预算, 收工")
             break
-        if srt_base_of(groups[base]) in existing and not a.force:
-            # 已有同名 srt -> 幂等跳过(不下载/不转写), 保持索引稳定
-            continue
         try:
             if a.fix_srt:
                 fix_srt_group(SRC_REMOTE, SRC_DIR, base, groups[base], workdir, a.apply,
-                              re_burn=(not a.no_reburn))
+                              re_burn=False)
             else:
                 process_group(SRC_REMOTE, SRC_DIR, base, groups[base], workdir, a.apply,
-                              probe_seconds=a.probe_only, burn_only=a.burn_only)
+                              probe_seconds=a.probe_only, burn_only=False)
             ok += 1
         except Exception as e:
             fail += 1
             log("!! 组处理失败: %s" % str(e)[:200])
     shutil.rmtree(workdir, ignore_errors=True)
     log("完成: ok=%d fail=%d" % (ok, fail))
-    if ok == 0 and fail == 0 and targets:
-        log("!! 本批 0 产出: 窗口内 %d 组全部已有 srt —— start_index=%d 已过期, 检查 subtitle_dispatch 的派发位置"
-            % (len(targets), a.start_index))
 
 
 if __name__ == "__main__":

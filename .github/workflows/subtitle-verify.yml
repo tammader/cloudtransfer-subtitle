@@ -1,9 +1,9 @@
 name: subtitle-verify
 
 # 字幕质量校验(第二段的前置关卡): 扫描源目录所有 .srt, 逐条查
-#   日文残留 / 思考过程泄漏 / 空条目, 汇总成报告发 Telegram。
-# 手动跑一次即可确认"翻译没问题"; 烧录阶段(subtitle-burn)会自己再闸门一次。
-# Secrets: RCLONE_CONF / PATHS_JSON / TG_TOKEN / TG_CHAT_ID
+#   空条目 / 元信息泄漏 / 单条过长 / 非日文内容, 报告打进 run 日志。
+# 手动跑一次即可确认字幕没问题。
+# Secrets: RCLONE_CONF / PATHS_JSON
 
 on:
   schedule:
@@ -29,8 +29,6 @@ permissions:
 
 env:
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
-  TG_TOKEN: ${{ secrets.TG_TOKEN }}
-  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
 jobs:
   verify:
@@ -54,7 +52,7 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: 校验 srt 质量并发报告
+      - name: 校验 srt 质量(报告打进日志)
         run: |
           python3 verify_srt.py --tg \
             --max-bad-file-ratio "${{ inputs.max_bad_file_ratio || '0.02' }}" \
