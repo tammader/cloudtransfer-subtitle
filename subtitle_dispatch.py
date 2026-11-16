@@ -26,7 +26,7 @@ import subtitle_progress as sp
 logmask.install()
 
 API = "https://api.github.com"
-REPO = "maddertam-oss/cloudtransfer"
+REPO = "tammader/cloudtransfer-subtitle"
 WF = "subtitle-translate.yml"
 TARGET_PARALLEL = int(os.environ.get("TARGET_PARALLEL", "20"))   # 并发批次(仓库 Variables 可调)
 GROUPS_PER_RUN = int(os.environ.get("GROUPS_PER_RUN", "3"))     # 每批次处理几组

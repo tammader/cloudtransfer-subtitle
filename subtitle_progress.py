@@ -93,7 +93,7 @@ def gh_runs():
     tok = os.environ.get("GH_TOKEN", "")
     if not tok:
         return None
-    url = "https://api.github.com/repos/maddertam-oss/cloudtransfer/actions/runs?per_page=20"
+    url = "https://api.github.com/repos/tammader/cloudtransfer-subtitle/actions/runs?per_page=20"
     req = urllib.request.Request(url, headers={"Authorization": "token " + tok,
                                                "User-Agent": "wb-substat",
                                                "Accept": "application/vnd.github+json"})
