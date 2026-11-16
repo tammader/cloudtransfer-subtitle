@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +36,27 @@ PHASE = (os.environ.get("PHASE") or "translate").strip().lower()  # translate | 
 
 def log(m):
     print("%s %s" % (time.strftime("%H:%M:%S"), m), flush=True)
+
+
+def tg_alert(text):
+    """派发异常时给 Telegram 发告警。缺 token/网络异常都静默失败, 绝不影响主流程。
+
+    触发场景: GH_TOKEN 失效或权限不足 → dispatch API 回 404, 补发 0/N, 流程静默停摆。
+    (2026-11-16 实战教训: 静默 404 让字幕流程停了一小时无人知, 故加此告警)
+    """
+    token = os.environ.get("TG_TOKEN", "").strip()
+    chat = os.environ.get("TG_CHAT_ID", "").strip()
+    if not token or not chat:
+        return
+    try:
+        body = urllib.parse.urlencode({"chat_id": chat, "text": text,
+                                       "disable_web_page_preview": "true"}).encode()
+        req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % token,
+                                     data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as x:
+            x.read()
+    except Exception as e:
+        log("!! TG 告警发送失败: %s" % str(e)[:120])
 
 
 def gh_req(method, path, tok, body=None):
@@ -77,6 +99,13 @@ def main():
 
     # 2) 活跃 run 数
     st, d = gh_req("GET", "/repos/%s/actions/workflows/%s/runs?per_page=30" % (REPO, WF), tok)
+    if st != 200:
+        # token 失效/权限不足时连查询都会失败 —— 这是比 404 更早的信号
+        log("!! 查询活跃 run 失败: %s %s" % (st, d.get("_err", ""))[:180])
+        tg_alert("⚠️ 字幕调度器异常\n查询 subtitle-translate runs 失败 (HTTP %s)\n"
+                 "多半是 GH_TOKEN 失效/权限不足，自动派发已停，请检查 Secret。"
+                 % st)
+        return 1
     runs = d.get("workflow_runs") or [] if st == 200 else []
     act = [r for r in runs if r["status"] in ("queued", "in_progress")]
     log("活跃批次: %d" % len(act))
@@ -93,6 +122,8 @@ def main():
         return 0
     bt = int(time.time())
     n_ok = 0
+    first_err = ""
+    first_code = None
     base = len(act)                      # 排在已在跑的批次之后, 避免区间重叠
     for i in range(need):
         si = (base + i) * GROUPS_PER_RUN    # 0,3,6,9... 不重叠
@@ -105,9 +136,20 @@ def main():
             n_ok += 1
             log("补发批次 si=%d 组数=%d OK" % (si, GROUPS_PER_RUN))
         else:
+            if first_code is None:
+                first_code = st
+                first_err = dd.get("_err", "")
             log("补发失败 si=%d: %s %s" % (si, st, dd.get("_err", ""))[:180])
         time.sleep(2)
     log("本轮补发 %d/%d" % (n_ok, need))
+
+    # 关键告警: 明明有活要派(need>0) 却一个批次都没派出去 —— 就是今天这种静默停摆
+    if need > 0 and n_ok == 0:
+        tg_alert("🛑 字幕流程自动派发失败(0/%d)\n"
+                 "待处理 %d 组, 无活跃批次, 但 dispatch 全部失败 (HTTP %s)。\n"
+                 "通常=GH_TOKEN 失效/权限不足或 workflow 定义变更。\n"
+                 "错误: %s\n请尽快检查，否则字幕将停摆。" % (
+                     need, todo, first_code, (first_err or "")[:200]))
     return 0
 
 
